@@ -1,0 +1,12 @@
+[package]
+name = "atlas_ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+hnsw_rs = "0.3.3"
+petgraph = "0.6"
+rand = "0.8"

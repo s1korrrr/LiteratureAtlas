@@ -1,0 +1,22 @@
+# Swift / Xcode
+.build/
+.DS_Store
+
+# Derived data / caches
+Output/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Rust
+analytics/ffi/target/
+analytics/rust/target/
+
+# Analytics virtualenv
+analytics/.venv/
+
+# Editors
+.vscode/
+.cursor/

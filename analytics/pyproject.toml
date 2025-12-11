@@ -1,0 +1,18 @@
+[project]
+name = "literature-atlas-analytics"
+version = "0.1.0"
+description = "Local analytics pipeline for LiteratureAtlas"
+authors = [{ name = "LiteratureAtlas" }]
+requires-python = ">=3.10"
+dependencies = [
+  "duckdb>=1.0.0",
+  "numpy>=1.26",
+  "pandas>=2.0",
+  "scikit-learn>=1.5",
+]
+
+[tool.uv]
+# uv will manage the virtualenv; lock optional
+
+[tool.uv.sources]
+# Placeholders for local packages if added later

@@ -1,0 +1,4 @@
+module AtlasFFIClib {
+  header "atlas_ffi.h"
+  export *
+}
