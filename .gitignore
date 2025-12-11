@@ -20,3 +20,6 @@ analytics/.venv/
 # Editors
 .vscode/
 .cursor/
+
+#examples
+examples/
