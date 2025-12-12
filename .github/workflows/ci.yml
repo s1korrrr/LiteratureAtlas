@@ -1,0 +1,17 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  swift:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Rust FFI (macOS)
+        run: cargo build --manifest-path analytics/ffi/Cargo.toml --release
+      - name: Swift tests
+        run: swift test
+

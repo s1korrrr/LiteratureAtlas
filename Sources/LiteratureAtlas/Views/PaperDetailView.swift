@@ -17,6 +17,18 @@ struct PaperDetailView: View {
     @State private var quizIndex: Int = 0
     @State private var revealAnswer: Bool = false
 
+    private var metrics: AnalyticsSummary.PaperMetric? {
+        model.analyticsSummary?.paperMetrics.first(where: { $0.paperID == paper.id })
+    }
+
+    private var dominantFactorLabel: String? {
+        guard let summary = model.analyticsSummary else { return nil }
+        guard let entry = summary.factorLoadings.first(where: { $0.paperID == paper.id }) else { return nil }
+        guard let maxIdx = entry.scores.enumerated().max(by: { $0.element < $1.element })?.offset else { return nil }
+        guard maxIdx < summary.factorLabels.count else { return "F\(maxIdx)" }
+        return "F\(maxIdx): \(summary.factorLabels[maxIdx])"
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
@@ -28,6 +40,37 @@ struct PaperDetailView: View {
                         Text(paper.summary)
                             .font(.body)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                }
+
+                if let m = metrics {
+                    GlassCard {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Impact signals").font(.headline)
+                            if let dom = dominantFactorLabel {
+                                Text("Dominant factor: \(dom)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            HStack {
+                                MetricPill(label: "Novelty z", value: m.zNovelty, tint: .pink)
+                                MetricPill(label: "Consensus z", value: m.zConsensus, tint: .mint)
+                                MetricPill(label: "Comb novelty", value: m.novCombinatorial, tint: .orange)
+                            }
+                            HStack {
+                                MetricPill(label: "Influence +", value: m.influencePos, tint: .green)
+                                MetricPill(label: "Influence −", value: m.influenceNeg, tint: .red)
+                                MetricPill(label: "Drift contrib", value: m.driftContrib, tint: .cyan)
+                            }
+                            HStack(spacing: 10) {
+                                RoleBadge(label: "Originator", value: m.roleSource)
+                                RoleBadge(label: "Bridge", value: m.roleBridge)
+                                RoleBadge(label: "Consolidator", value: m.roleSink)
+                            }
+                            Text(String(format: "Uncertainty: novelty ±%.3f; consensus ±%.3f", m.noveltyUncertainty, m.consensusUncertainty))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
 
@@ -433,5 +476,42 @@ private struct FlashcardQuizView: View {
         }
         .padding()
         .frame(minWidth: 360, minHeight: 320)
+    }
+}
+
+// MARK: - Metric helper views
+
+private struct MetricPill: View {
+    let label: String
+    let value: Double
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption2).foregroundStyle(.secondary)
+            Text(String(format: "%.2f", value))
+                .font(.caption.bold())
+                .padding(.horizontal, 8).padding(.vertical, 4)
+                .background(tint.opacity(0.15))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+}
+
+private struct RoleBadge: View {
+    let label: String
+    let value: Double
+    var body: some View {
+        HStack(spacing: 6) {
+            Circle().fill(Color.white.opacity(0.2)).frame(width: 10, height: 10)
+            Text(label)
+                .font(.caption2)
+            Text(String(format: "%.2f", value))
+                .font(.caption2.bold())
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color.white.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 }

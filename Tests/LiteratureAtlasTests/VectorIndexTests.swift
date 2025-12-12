@@ -34,4 +34,17 @@ final class VectorIndexTests: XCTestCase {
         let results = index.query([1, 0, 0], k: 1) // different dimension
         XCTAssertTrue(results.isEmpty)
     }
+
+    func testQueryReturnsEmptyWhenKIsZero() {
+        let vectors: [[Float]] = [
+            [1, 0, 0],
+            [0, 1, 0]
+        ]
+        guard let index = VectorIndex(vectors: vectors) else {
+            return XCTFail("Expected index to initialize")
+        }
+
+        let results = index.query([1, 0, 0], k: 0)
+        XCTAssertTrue(results.isEmpty)
+    }
 }

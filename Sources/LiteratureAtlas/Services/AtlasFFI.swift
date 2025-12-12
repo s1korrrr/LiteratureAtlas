@@ -6,9 +6,6 @@ import AtlasFFIClib
 @available(macOS 26, iOS 26, *)
 @MainActor
 enum AtlasFFI {
-    // Use linked symbols by default; dlopen remains as backup.
-    static let linked: Bool = true
-
     private static let handle: UnsafeMutableRawPointer? = {
         let paths = [
             "analytics/ffi/target/release/libatlas_ffi.dylib",
@@ -32,56 +29,65 @@ enum AtlasFFI {
     // Use opaque out pointer to avoid ObjC representability issues.
     typealias QueryFn = @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<Float>?, UInt32, UnsafeMutableRawPointer?) -> UInt32
 
-    static func isAvailable() -> Bool { linked || handle != nil }
+    static func isAvailable() -> Bool {
+        #if ATLAS_FFI_LINKED
+        return true
+        #else
+        return handle != nil
+        #endif
+    }
 
     static func buildIndex(vectors: [[Float]]) -> UnsafeMutableRawPointer? {
-        guard let first = vectors.first else { return nil }
-        let dim = UInt32(first.count)
+        guard let first = vectors.first, !first.isEmpty else { return nil }
+        let dimCount = first.count
+        guard vectors.allSatisfy({ $0.count == dimCount }) else { return nil }
+        let dim = UInt32(dimCount)
         let n = UInt32(vectors.count)
         var flat: [Float] = []
-        flat.reserveCapacity(first.count * vectors.count)
+        flat.reserveCapacity(dimCount * vectors.count)
         for v in vectors { flat.append(contentsOf: v) }
 
-        if linked {
-            return flat.withUnsafeBufferPointer { buf in
-                atlas_build_index(dim, n, buf.baseAddress)
-            }
-        } else {
-            guard let build: BuildFn = symbol("atlas_build_index", as: BuildFn.self) else { return nil }
-            return flat.withUnsafeBufferPointer { buf in
-                build(dim, n, buf.baseAddress)
-            }
+        #if ATLAS_FFI_LINKED
+        return flat.withUnsafeBufferPointer { buf in
+            atlas_build_index(dim, n, buf.baseAddress)
         }
+        #else
+        guard let build: BuildFn = symbol("atlas_build_index", as: BuildFn.self) else { return nil }
+        return flat.withUnsafeBufferPointer { buf in
+            build(dim, n, buf.baseAddress)
+        }
+        #endif
     }
 
     static func query(index: UnsafeMutableRawPointer?, query: [Float], k: Int) -> [AtlasSearchResult] {
-        if linked {
-            var results = [AtlasFFIClib.AtlasSearchResult](repeating: AtlasFFIClib.AtlasSearchResult(index: 0, distance: 0), count: k)
-            let wrote = query.withUnsafeBufferPointer { qbuf -> UInt32 in
-                results.withUnsafeMutableBufferPointer { outBuf -> UInt32 in
-                    atlas_query_index(index, qbuf.baseAddress, UInt32(k), outBuf.baseAddress)
-                }
+        guard index != nil, k > 0, !query.isEmpty else { return [] }
+        #if ATLAS_FFI_LINKED
+        var results = [AtlasFFIClib.AtlasSearchResult](repeating: AtlasFFIClib.AtlasSearchResult(index: 0, distance: 0), count: k)
+        let wrote = query.withUnsafeBufferPointer { qbuf -> UInt32 in
+            results.withUnsafeMutableBufferPointer { outBuf -> UInt32 in
+                atlas_query_index(index, qbuf.baseAddress, UInt32(k), outBuf.baseAddress)
             }
-            return Array(results.prefix(Int(wrote))).map { AtlasSearchResult(index: $0.index, distance: $0.distance) }
-        } else {
-            guard let qfn: QueryFn = symbol("atlas_query_index", as: QueryFn.self) else { return [] }
-            var results = [AtlasSearchResult](repeating: AtlasSearchResult(index: 0, distance: .infinity), count: k)
-            let wrote = query.withUnsafeBufferPointer { qbuf -> UInt32 in
-                results.withUnsafeMutableBytes { outBuf -> UInt32 in
-                    qfn(index, qbuf.baseAddress, UInt32(k), outBuf.baseAddress)
-                }
-            }
-            return Array(results.prefix(Int(wrote)))
         }
+        return Array(results.prefix(Int(wrote))).map { AtlasSearchResult(index: $0.index, distance: $0.distance) }
+        #else
+        guard let qfn: QueryFn = symbol("atlas_query_index", as: QueryFn.self) else { return [] }
+        var results = [AtlasSearchResult](repeating: AtlasSearchResult(index: 0, distance: .infinity), count: k)
+        let wrote = query.withUnsafeBufferPointer { qbuf -> UInt32 in
+            results.withUnsafeMutableBytes { outBuf -> UInt32 in
+                qfn(index, qbuf.baseAddress, UInt32(k), outBuf.baseAddress)
+            }
+        }
+        return Array(results.prefix(Int(wrote)))
+        #endif
     }
 
     static func free(index: UnsafeMutableRawPointer?) {
-        if linked {
-            atlas_free_index(index)
-        } else {
-            guard let f: FreeFn = symbol("atlas_free_index", as: FreeFn.self) else { return }
-            f(index)
-        }
+        #if ATLAS_FFI_LINKED
+        atlas_free_index(index)
+        #else
+        guard let f: FreeFn = symbol("atlas_free_index", as: FreeFn.self) else { return }
+        f(index)
+        #endif
     }
 }
 

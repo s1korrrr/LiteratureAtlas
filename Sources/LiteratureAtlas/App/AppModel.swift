@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 import SwiftUI
 import Accelerate
 import FoundationModels
@@ -68,6 +69,7 @@ final class AppModel: ObservableObject {
     private let clusterSummarizer = ClusterSummarizerActor()
     private let questionAnswerer = QuestionAnswerActor()
     private let embedder = SentenceEmbedder(language: .english)
+    private let logger = Logger(subsystem: "LiteratureAtlas", category: "AppModel")
     private var ingestionTask: Task<Void, Never>?
     private var canonicalEmbeddingDim: Int?
     private var clusterCache: [ClusterCacheKey: [Cluster]] = [:]
@@ -83,6 +85,10 @@ final class AppModel: ObservableObject {
         } else {
             outputRoot = AppModel.makePrimaryOutputRoot()
             legacyOutputRoot = AppModel.makeLegacyOutputRoot()
+        }
+        if canonicalEmbeddingDim == nil {
+            let d = embedder.dimension
+            if d > 0 { canonicalEmbeddingDim = d }
         }
         if !skipInitialLoad {
             Task {
@@ -103,9 +109,19 @@ final class AppModel: ObservableObject {
     }
 
     private static func prepareOutputRoot(_ root: URL) {
-        try? FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        ["papers", "qa", "clusters", "chunks", "analytics"].forEach { folder in
-            try? FileManager.default.createDirectory(at: root.appendingPathComponent(folder, isDirectory: true), withIntermediateDirectories: true)
+        let logger = Logger(subsystem: "LiteratureAtlas", category: "IO")
+        do {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        } catch {
+            logger.error("Failed to create Output root at \(root.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
+        for folder in ["papers", "qa", "clusters", "chunks", "analytics"] {
+            let url = root.appendingPathComponent(folder, isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            } catch {
+                logger.error("Failed to create Output subfolder \(url.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
@@ -158,7 +174,7 @@ final class AppModel: ObservableObject {
     func ingestFolder(url: URL) {
         selectedFolder = url
         ingestionLog = "Selected folder: \(url.lastPathComponent)"
-        print("[Ingest] Selected folder: \(url.path)")
+        logger.info("[Ingest] Selected folder: \(url.path, privacy: .public)")
         ingestionTask?.cancel()
         ingestionTask = Task { await runIngestion(folderURL: url) }
     }
@@ -194,7 +210,7 @@ final class AppModel: ObservableObject {
         let pdfs = items.filter { $0.pathExtension.lowercased() == "pdf" }
         guard !pdfs.isEmpty else {
             ingestionLog += "\nNo PDF files found in folder."
-            print("[Ingest] No PDFs found in folder \(folderURL.path)")
+            logger.info("[Ingest] No PDFs found in folder \(folderURL.path, privacy: .public)")
             isIngesting = false
             return
         }
@@ -209,7 +225,7 @@ final class AppModel: ObservableObject {
 
             ingestionCurrentFile = pdfURL.lastPathComponent
             ingestionLog += "\n\n[>] Processing \(pdfURL.lastPathComponent)..."
-            print("[Ingest] Processing: \(pdfURL.lastPathComponent)")
+            logger.info("[Ingest] Processing: \(pdfURL.lastPathComponent, privacy: .public)")
 
             if Task.isCancelled { break }
 
@@ -324,7 +340,7 @@ final class AppModel: ObservableObject {
                 }
             } catch {
                 ingestionLog += "\n  Error: \(error.localizedDescription)"
-                print("[Ingest] Error: \(error.localizedDescription)")
+                logger.error("[Ingest] Error: \(error.localizedDescription, privacy: .public)")
             }
 
             ingestionProgress = Double(index + 1) / Double(max(pdfs.count, 1))
@@ -336,7 +352,7 @@ final class AppModel: ObservableObject {
             ingestionLog += "\nIngestion cancelled after \(ingestionCompletedCount) files."
         } else {
             ingestionLog += "\n\nIngestion complete. Processed \(papers.count) papers."
-            print("[Ingest] Completed. Processed \(papers.count) papers.")
+            logger.info("[Ingest] Completed. Processed \(self.papers.count, privacy: .public) papers.")
             recomputeReadingProfile(extra: nil)
             if papers.count >= 3 {
                 Task { await buildMultiScaleGalaxy() }
@@ -624,8 +640,11 @@ final class AppModel: ObservableObject {
 
     private func saveChunkIndex() {
         let url = outputRoot.appendingPathComponent("chunks", isDirectory: true).appendingPathComponent("chunks.json")
-        if let data = try? JSONEncoder().encode(paperChunks) {
-            try? data.write(to: url, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(paperChunks)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            logger.error("Failed to save chunks index: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -705,8 +724,11 @@ final class AppModel: ObservableObject {
 
         let index = papers.map { Minimal(id: $0.id, title: $0.title, summary: $0.summary) }
         let url = outputRoot.appendingPathComponent("papers", isDirectory: true).appendingPathComponent("index.json")
-        if let data = try? JSONEncoder().encode(index) {
-            try? data.write(to: url, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(index)
+            try data.write(to: url, options: .atomic)
+        } catch {
+            logger.error("Failed to save paper index: \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -752,7 +774,14 @@ final class AppModel: ObservableObject {
         let kClamped = min(max(1, k), embeddings.count)
         ingestionLog += "\n\n[cluster] Clustering into \(kClamped) clusters..."
 
-        let (assignments, centroids) = KMeans.cluster(vectors: embeddings, k: kClamped, iterations: 25)
+        let compute = await Task.detached(priority: .userInitiated) { () -> (assignments: [Int], centroids: [[Float]], positions: [Point2D]) in
+            let (assignments, centroids) = KMeans.cluster(vectors: embeddings, k: kClamped, iterations: 25)
+            let positions = ForceLayout.compute(for: centroids)
+            return (assignments, centroids, positions)
+        }.value
+        let assignments = compute.assignments
+        let centroids = compute.centroids
+        let positions = compute.positions
 
         for i in validPapers.indices {
             if let originalIndex = papers.firstIndex(where: { $0.id == validPapers[i].id }) {
@@ -797,12 +826,16 @@ final class AppModel: ObservableObject {
                 )
                 newClusters.append(cluster)
             }
-
-            clusteringProgress = Double(clusterID + 1) / Double(kClamped)
         }
 
-        let positioned = applyForceLayout(to: newClusters)
-        clusters = positioned.sorted { $0.id < $1.id }
+        // Apply precomputed force layout positions.
+        for idx in newClusters.indices {
+            let cid = newClusters[idx].id
+            if cid < positions.count {
+                newClusters[idx].layoutPosition = positions[cid]
+            }
+        }
+        clusters = newClusters.sorted { $0.id < $1.id }
         ingestionLog += "\nClustering and meta-summaries complete."
         isClustering = false
         clusteringProgress = 1
@@ -825,75 +858,136 @@ final class AppModel: ObservableObject {
             return
         }
 
-        let kMega = min(max(level0Range.lowerBound, validPapers.count / max(1, validPapers.count / 6)), min(level0Range.upperBound, validPapers.count))
+        let corpusVersion = currentCorpusVersion()
+        let inputs: [(id: UUID, embedding: [Float])] = validPapers.map { ($0.id, $0.embedding) }
 
-        let embeddings = validPapers.map { $0.embedding }
-        let (megaAssignments, megaCentroids) = KMeans.cluster(vectors: embeddings, k: kMega, iterations: 30)
+        let compute = await Task.detached(priority: .userInitiated) { () -> GalaxyComputeResult in
+            let count = inputs.count
+            let kMega = min(
+                max(level0Range.lowerBound, count / max(1, count / 6)),
+                min(level0Range.upperBound, count)
+            )
 
-        var megaNodes: [Cluster] = []
-        var subtopicFlat: [Cluster] = []
-        var updatedPapers = papers
+            let embeddings = inputs.map { $0.embedding }
+            let (megaAssignments, megaCentroids) = KMeans.cluster(vectors: embeddings, k: kMega, iterations: 30)
 
-        for megaID in 0..<kMega {
-            let memberIndices = megaAssignments.enumerated().filter { $0.element == megaID }.map { $0.offset }
-            guard !memberIndices.isEmpty else { continue }
-            let members = memberIndices.map { validPapers[$0] }
-            let centroid = megaCentroids[megaID]
+            var megaInfos: [GalaxyClusterInfo] = []
+            var subInfos: [GalaxyClusterInfo] = []
+            var assignmentsByID: [UUID: Int] = [:]
 
-            // Subtopics within this mega-topic
-            let desiredSubK = min(max(level1Range.lowerBound, members.count / max(1, members.count / 12)), min(level1Range.upperBound, members.count))
-            var subclusters: [Cluster] = []
-            if members.count >= 2 {
-                let (subAssign, subCentroids) = KMeans.cluster(vectors: members.map { $0.embedding }, k: desiredSubK, iterations: 20)
-                for subID in 0..<desiredSubK {
-                    let localIdxs = subAssign.enumerated().filter { $0.element == subID }.map { $0.offset }
-                    guard !localIdxs.isEmpty else { continue }
-                    let subMembers = localIdxs.map { members[$0] }
-                    let subCentroid = subCentroids[subID]
+            for megaID in 0..<kMega {
+                let memberIndices = megaAssignments.enumerated().filter { $0.element == megaID }.map { $0.offset }
+                guard !memberIndices.isEmpty else { continue }
+                let members = memberIndices.map { inputs[$0] }
+                let centroid = megaCentroids[megaID]
 
-                    let subClusterID = megaID * 1000 + subID
-                    let subCluster = Cluster(
-                        id: subClusterID,
-                        name: "Subtopic \(megaID + 1).\(subID + 1)",
-                        metaSummary: "Contains \(subMembers.count) papers.",
-                        centroid: subCentroid,
-                        memberPaperIDs: subMembers.map { $0.id },
-                        layoutPosition: nil,
-                        resolutionK: desiredSubK,
-                        corpusVersion: currentCorpusVersion(),
-                        subclusters: nil
-                    )
-                    subclusters.append(subCluster)
+                // Default assignment to mega-topic; overwritten by subtopic ids.
+                for m in members { assignmentsByID[m.id] = megaID }
 
-                    for paper in subMembers {
-                        if let idx = updatedPapers.firstIndex(where: { $0.id == paper.id }) {
-                            updatedPapers[idx].clusterIndex = subClusterID
-                        }
+                // Subtopics within this mega-topic
+                let desiredSubK = min(
+                    max(level1Range.lowerBound, members.count / max(1, members.count / 12)),
+                    min(level1Range.upperBound, members.count)
+                )
+
+                var localSubInfos: [GalaxyClusterInfo] = []
+                var localSubIDs: [Int] = []
+
+                if members.count >= 2 && desiredSubK > 1 {
+                    let memberEmbeddings = members.map { $0.embedding }
+                    let (subAssign, subCentroids) = KMeans.cluster(vectors: memberEmbeddings, k: desiredSubK, iterations: 20)
+                    for subID in 0..<desiredSubK {
+                        let localIdxs = subAssign.enumerated().filter { $0.element == subID }.map { $0.offset }
+                        guard !localIdxs.isEmpty else { continue }
+                        let subMembers = localIdxs.map { members[$0] }
+                        let subCentroid = subCentroids[subID]
+
+                        let subClusterID = megaID * 1000 + subID
+                        localSubIDs.append(subClusterID)
+                        for paper in subMembers { assignmentsByID[paper.id] = subClusterID }
+
+                        let subInfo = GalaxyClusterInfo(
+                            id: subClusterID,
+                            name: "Subtopic \(megaID + 1).\(subID + 1)",
+                            metaSummary: "Contains \(subMembers.count) papers.",
+                            centroid: subCentroid,
+                            memberPaperIDs: subMembers.map { $0.id },
+                            layoutPosition: nil,
+                            resolutionK: desiredSubK,
+                            corpusVersion: corpusVersion,
+                            subclusterIDs: nil
+                        )
+                        localSubInfos.append(subInfo)
                     }
                 }
+
+                let subPositions = ForceLayout.compute(for: localSubInfos.map { $0.centroid })
+                for i in localSubInfos.indices {
+                    localSubInfos[i].layoutPosition = subPositions.indices.contains(i) ? subPositions[i] : nil
+                }
+                subInfos.append(contentsOf: localSubInfos)
+
+                let megaInfo = GalaxyClusterInfo(
+                    id: megaID,
+                    name: "Mega-topic \(megaID + 1)",
+                    metaSummary: "Contains \(members.count) papers across \(localSubInfos.count) subtopics.",
+                    centroid: centroid,
+                    memberPaperIDs: members.map { $0.id },
+                    layoutPosition: nil,
+                    resolutionK: kMega,
+                    corpusVersion: corpusVersion,
+                    subclusterIDs: localSubIDs
+                )
+                megaInfos.append(megaInfo)
             }
 
-            let positionedSubs = applyForceLayout(to: subclusters)
-            subtopicFlat.append(contentsOf: positionedSubs)
+            let megaPositions = ForceLayout.compute(for: megaInfos.map { $0.centroid })
+            for i in megaInfos.indices {
+                megaInfos[i].layoutPosition = megaPositions.indices.contains(i) ? megaPositions[i] : nil
+            }
 
-            let cluster = Cluster(
-                id: megaID,
-                name: "Mega-topic \(megaID + 1)",
-                metaSummary: "Contains \(members.count) papers across \(positionedSubs.count) subtopics.",
-                centroid: centroid,
-                memberPaperIDs: members.map { $0.id },
-                layoutPosition: nil,
-                resolutionK: kMega,
-                corpusVersion: currentCorpusVersion(),
-                subclusters: positionedSubs
-            )
-            megaNodes.append(cluster)
-            clusteringProgress = Double(megaNodes.count) / Double(max(1, kMega))
+            return GalaxyComputeResult(megaClusters: megaInfos, subclusters: subInfos, assignmentsByID: assignmentsByID)
+        }.value
+
+        var updatedPapers = papers
+        for idx in updatedPapers.indices {
+            if let assign = compute.assignmentsByID[updatedPapers[idx].id] {
+                updatedPapers[idx].clusterIndex = assign
+            }
         }
 
-        let positionedMega = applyForceLayout(to: megaNodes)
-        megaClusters = positionedMega
-        clusters = subtopicFlat.sorted { $0.id < $1.id }
+        let subBuilt: [Cluster] = compute.subclusters.map { info in
+            Cluster(
+                id: info.id,
+                name: info.name,
+                metaSummary: info.metaSummary,
+                centroid: info.centroid,
+                memberPaperIDs: info.memberPaperIDs,
+                layoutPosition: info.layoutPosition,
+                resolutionK: info.resolutionK,
+                corpusVersion: info.corpusVersion,
+                subclusters: nil
+            )
+        }
+        let subByID = Dictionary(uniqueKeysWithValues: subBuilt.map { ($0.id, $0) })
+
+        let megaBuilt: [Cluster] = compute.megaClusters.map { info in
+            let subs = (info.subclusterIDs ?? []).compactMap { subByID[$0] }
+            return Cluster(
+                id: info.id,
+                name: info.name,
+                metaSummary: info.metaSummary,
+                centroid: info.centroid,
+                memberPaperIDs: info.memberPaperIDs,
+                layoutPosition: info.layoutPosition,
+                resolutionK: info.resolutionK,
+                corpusVersion: info.corpusVersion,
+                subclusters: subs
+            )
+        }
+
+        megaClusters = megaBuilt
+        clusters = subBuilt.sorted { $0.id < $1.id }
         papers = updatedPapers
         isClustering = false
         clusteringProgress = 1
@@ -914,6 +1008,9 @@ final class AppModel: ObservableObject {
         guard !clusters.isEmpty else { return clusters }
         switch lens {
         case .standard:
+            if clusters.allSatisfy({ $0.layoutPosition != nil }) {
+                return clusters
+            }
             return applyForceLayout(to: clusters)
         case .time:
             let years = clusters.compactMap { averageYear(for: $0) }
@@ -999,9 +1096,12 @@ final class AppModel: ObservableObject {
         let folder = outputRoot.appendingPathComponent("clusters", isDirectory: true)
         let url = folder.appendingPathComponent("clusters_\(key.version)_k\(key.k).json")
         let encoder = JSONEncoder()
-        if let data = try? encoder.encode(ClusterSnapshot(version: key.version, k: key.k, clusters: clusters)) {
-            try? data.write(to: url, options: .atomic)
+        do {
+            let data = try encoder.encode(ClusterSnapshot(version: key.version, k: key.k, clusters: clusters))
+            try data.write(to: url, options: .atomic)
             ingestionLog += "\nSaved cluster snapshot: k=\(key.k)."
+        } catch {
+            logger.error("Failed to persist cluster snapshot k=\(key.k): \(error.localizedDescription, privacy: .public)")
         }
     }
 
@@ -1441,8 +1541,9 @@ final class AppModel: ObservableObject {
 
         let known = knownPapers
             .compactMap { p -> (Paper, Float)? in
-                guard p.embedding.count == queryVec.count else { return nil }
-                let score = cosineSimilarity(p.embedding, queryVec)
+                let emb = normalizeEmbedding(p.embedding)
+                guard emb.count == queryVec.count else { return nil }
+                let score = cosineSimilarity(emb, queryVec)
                 return score.isNaN ? nil : (p, score)
             }
             .sorted { $0.1 > $1.1 }
@@ -1451,8 +1552,9 @@ final class AppModel: ObservableObject {
 
         let missing = unread
             .compactMap { p -> (Paper, Float)? in
-                guard p.embedding.count == queryVec.count else { return nil }
-                let score = cosineSimilarity(p.embedding, queryVec)
+                let emb = normalizeEmbedding(p.embedding)
+                guard emb.count == queryVec.count else { return nil }
+                let score = cosineSimilarity(emb, queryVec)
                 return score.isNaN ? nil : (p, score)
             }
             .sorted { $0.1 > $1.1 }
@@ -1532,7 +1634,13 @@ final class AppModel: ObservableObject {
 
         let fileName = question.replacingOccurrences(of: "/", with: "-").prefix(40)
         let qaURL = outputRoot.appendingPathComponent("qa", isDirectory: true).appendingPathComponent("QA_\(fileName).txt")
-        try? questionAnswer.data(using: .utf8)?.write(to: qaURL, options: .atomic)
+        do {
+            if let data = questionAnswer.data(using: .utf8) {
+                try data.write(to: qaURL, options: .atomic)
+            }
+        } catch {
+            logger.error("Failed to save QA answer: \(error.localizedDescription, privacy: .public)")
+        }
         recordAnswerReady(question)
         appendUserEvent(type: "qa_evidence_viewed", paperID: nil, extra: ["count": questionEvidence.count])
 
@@ -1772,10 +1880,40 @@ private struct ClusterSnapshot: Codable {
     let clusters: [Cluster]
 }
 
+private struct GalaxyClusterInfo: Sendable {
+    let id: Int
+    let name: String
+    let metaSummary: String
+    let centroid: [Float]
+    let memberPaperIDs: [UUID]
+    var layoutPosition: Point2D?
+    let resolutionK: Int
+    let corpusVersion: String
+    let subclusterIDs: [Int]?
+}
+
+private struct GalaxyComputeResult: Sendable {
+    let megaClusters: [GalaxyClusterInfo]
+    let subclusters: [GalaxyClusterInfo]
+    let assignmentsByID: [UUID: Int]
+}
+
 private enum ForceLayout {
     static func compute(for vectors: [[Float]]) -> [Point2D] {
         let count = vectors.count
         guard count > 0 else { return [] }
+
+        let dim = vectors[0].count
+        guard dim > 0 else {
+            return Array(repeating: Point2D(x: 0.5, y: 0.5), count: count)
+        }
+        let normalizedVectors: [[Float]] = vectors.map { v in
+            if v.count == dim { return v }
+            if v.count > dim { return Array(v.prefix(dim)) }
+            var vv = v
+            vv.append(contentsOf: repeatElement(0, count: dim - v.count))
+            return vv
+        }
 
         var positions: [CGPoint] = (0..<count).map { idx in
             let angle = Double(idx) / Double(count) * 2 * Double.pi
@@ -1804,7 +1942,7 @@ private enum ForceLayout {
                     forces[j].y -= fy
 
                     // attraction based on cosine similarity
-                    let sim = max(0.0, Double(cosineSimilarity(vectors[i], vectors[j])))
+                    let sim = max(0.0, Double(cosineSimilarity(normalizedVectors[i], normalizedVectors[j])))
                     let att = attraction * sim
                     forces[i].x -= att * dx
                     forces[i].y -= att * dy

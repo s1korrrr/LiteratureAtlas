@@ -17,6 +17,22 @@ struct AnalyticsView: View {
     @State private var focusMyExposure: Bool = false
     @State private var selectedCounterfactual: String?
     @State private var customCutoffs: String = "2010 2015 2020"
+    @State private var selectedNoveltyPaper: Paper?
+    @State private var noveltyMode: NoveltyMode = .geometric
+    @State private var selectedClusterFilter: Int?
+    @State private var showFrontier: Bool = true
+
+    private enum NoveltyMode: String, CaseIterable, Identifiable {
+        case geometric, combinatorial, directional
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .geometric: return "Geometric"
+            case .combinatorial: return "Combinatorial"
+            case .directional: return "Directional"
+            }
+        }
+    }
 
     private var timeline: [(year: Int, count: Int)] {
         let counts = Dictionary(grouping: model.papers.compactMap { $0.year }) { $0 }
@@ -71,17 +87,50 @@ struct AnalyticsView: View {
     private struct NoveltyConsensusPoint: Identifiable {
         let id: UUID
         let novelty: Double
-        let centrality: Double
+        let consensus: Double
         let title: String
+        let clusterID: Int?
+        let novStd: Double
+        let consStd: Double
     }
 
     private var noveltyConsensus: [NoveltyConsensusPoint] {
         guard let summary = analyticsSummary else { return [] }
-        let centralityMap = Dictionary(uniqueKeysWithValues: summary.centrality.map { ($0.paperID, $0.weightedDegree) })
         let titleMap = Dictionary(uniqueKeysWithValues: model.papers.map { ($0.id, $0.title) })
+        let clusterMap = Dictionary(uniqueKeysWithValues: model.papers.map { ($0.id, $0.clusterIndex) })
+
+        if !summary.paperMetrics.isEmpty {
+            return summary.paperMetrics.compactMap { m in
+                guard let title = titleMap[m.paperID] else { return nil }
+                let noveltyVal: Double = {
+                    switch noveltyMode {
+                    case .geometric: return m.zNovelty
+                    case .combinatorial: return m.novCombinatorial
+                    case .directional: return m.novDirectional
+                    }
+                }()
+                let consensusVal = m.zConsensus
+                if let clusterFilter = selectedClusterFilter,
+                   clusterMap[m.paperID] != clusterFilter { return nil }
+                return NoveltyConsensusPoint(
+                    id: m.paperID,
+                    novelty: noveltyVal,
+                    consensus: consensusVal,
+                    title: title,
+                    clusterID: clusterMap[m.paperID] ?? nil,
+                    novStd: m.noveltyUncertainty,
+                    consStd: m.consensusUncertainty
+                )
+            }
+        }
+
+        // Fallback to legacy novelty/centrality
+        let centralityMap = Dictionary(uniqueKeysWithValues: summary.centrality.map { ($0.paperID, $0.weightedDegree) })
         return summary.novelty.compactMap { n in
             guard let c = centralityMap[n.paperID] else { return nil }
-            return NoveltyConsensusPoint(id: n.paperID, novelty: n.novelty, centrality: c, title: titleMap[n.paperID] ?? "Paper")
+            if let clusterFilter = selectedClusterFilter,
+               n.clusterID != clusterFilter { return nil }
+            return NoveltyConsensusPoint(id: n.paperID, novelty: n.novelty, consensus: c, title: titleMap[n.paperID] ?? "Paper", clusterID: n.clusterID, novStd: 0, consStd: 0)
         }
     }
 
@@ -90,10 +139,24 @@ struct AnalyticsView: View {
         return summary.drift.sorted { $0.drift > $1.drift }.prefix(5).map { ($0.clusterID, $0.year, $0.drift) }
     }
 
-    private var factorExposureSample: [AnalyticsSummary.FactorExposure] {
-        let base = filteredFactorExposures()
-        return Array(base.prefix(80))
+    private var driftVolatilityStats: [AnalyticsSummary.DriftVolatility] {
+        analyticsSummary?.driftVolatility ?? []
     }
+
+    private var noveltyFrontier: Set<UUID> {
+        var frontier: Set<UUID> = []
+        let pts = noveltyConsensus.sorted { $0.novelty > $1.novelty }
+        var bestCons: Double = -Double.infinity
+        for pt in pts {
+            if pt.consensus > bestCons {
+                frontier.insert(pt.id)
+                bestCons = pt.consensus
+            }
+        }
+        return frontier
+    }
+
+    private var factorExposures: [AnalyticsSummary.FactorExposure] { filteredFactorExposures() }
 
     private var influenceTop: [(paper: Paper, score: Double)] {
         guard let summary = analyticsSummary else { return [] }
@@ -103,6 +166,44 @@ struct AnalyticsView: View {
             .sorted { $0.1 > $1.1 }
             .prefix(5)
             .map { $0 }
+    }
+
+    private var influenceTimeline: [(paper: Paper, score: Double, year: Int?)] {
+        guard let summary = analyticsSummary else { return [] }
+        let map = Dictionary(uniqueKeysWithValues: model.papers.map { ($0.id, $0) })
+        let seq = summary.influence
+            .compactMap { entry in
+                map[entry.paperID].map { ($0, entry.influence, $0.year) }
+            }
+            .sorted { ($0.2 ?? 9999, -$0.1) < ($1.2 ?? 9999, -$1.1) }
+            .prefix(10)
+        return Array(seq)
+    }
+
+    private var ideaRiver: [Paper] {
+        guard let summary = analyticsSummary else { return [] }
+        guard !summary.ideaFlowEdges.isEmpty else { return [] }
+        let paperMap = Dictionary(uniqueKeysWithValues: model.papers.map { ($0.id, $0) })
+        let influenceMap = Dictionary(uniqueKeysWithValues: summary.influence.map { ($0.paperID, $0.influence) })
+        guard let startID = influenceMap.max(by: { $0.value < $1.value })?.key,
+              let startPaper = paperMap[startID] else { return [] }
+
+        var path: [Paper] = [startPaper]
+        var current = startID
+        var visited: Set<UUID> = [startID]
+        let outEdges = Dictionary(grouping: summary.ideaFlowEdges) { $0.src }
+
+        for _ in 0..<5 {
+            guard let options = outEdges[current], !options.isEmpty else { break }
+            let next = options
+                .filter { $0.dst != nil && !visited.contains($0.dst!) }
+                .max(by: { ($0.weight ?? 0) < ($1.weight ?? 0) })
+            guard let dst = next?.dst, let paper = paperMap[dst] else { break }
+            path.append(paper)
+            visited.insert(dst)
+            current = dst
+        }
+        return path
     }
 
     private func closestPapersForUncertainty() -> [Paper] {
@@ -119,12 +220,11 @@ struct AnalyticsView: View {
     }
 
     private func filteredFactorExposures() -> [AnalyticsSummary.FactorExposure] {
-        guard focusMyExposure, let _ = analyticsSummary else {
-            return analyticsSummary?.factorExposures ?? []
+        guard let summary = analyticsSummary else { return [] }
+        if focusMyExposure, !summary.userFactorExposures.isEmpty {
+            return summary.userFactorExposures
         }
-        // Use only exposures for papers the user has marked done/important
-        let keep = Set(model.papers.filter { $0.readingStatus == .done || ($0.isImportant ?? false) }.compactMap { $0.year })
-        return (analyticsSummary?.factorExposures ?? []).filter { keep.contains($0.year) }
+        return summary.factorExposures
     }
 
     private var counterfactualStats: (paperCount: Int, avgCentrality: Double) {
@@ -152,13 +252,310 @@ struct AnalyticsView: View {
         return formatter.string(from: date)
     }
 
+    private func factorLabel(for idx: Int) -> String {
+        if let labels = analyticsSummary?.factorLabels, idx < labels.count {
+            return labels[idx]
+        }
+        return "F\(idx)"
+    }
+
+    @ViewBuilder private func noveltyCard() -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Novelty vs consensus").font(.headline)
+                let points = noveltyConsensus
+                HStack {
+                    Picker("Mode", selection: $noveltyMode) {
+                        ForEach(NoveltyMode.allCases) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    Picker("Cluster", selection: Binding(
+                        get: { selectedClusterFilter },
+                        set: { selectedClusterFilter = $0 }
+                    )) {
+                        Text("All clusters").tag(Optional<Int>(nil))
+                        ForEach(model.clusters, id: \.id) { c in
+                            Text(c.name.prefix(16)).tag(Optional<Int>(c.id))
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+                Toggle("Highlight Pareto frontier", isOn: $showFrontier)
+                    .font(.caption)
+                    .toggleStyle(.switch)
+                noveltyChart(points: points)
+                Text("Quadrants: high/high = anchors; high novelty/low consensus = hidden gems. Pareto frontier shows best trade-offs.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if let sel = selectedNoveltyPaper {
+                    Text("Selected: \(sel.title)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func driftCard() -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Topic drift (semantic motion)").font(.headline)
+                ForEach(driftTop, id: \.cluster) { entry in
+                    Text("Cluster \(entry.cluster) drifted \(String(format: "%.3f", entry.drift)) in \(entry.year)")
+                        .font(.caption)
+                }
+                if !driftVolatilityStats.isEmpty {
+                    Text("Volatility (std of yearly drift): " + driftVolatilityStats.map { "C\($0.clusterID)=\(String(format: "%.3f", $0.volatility))" }.joined(separator: " · "))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func factorCard(_ summary: AnalyticsSummary) -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Factor model over time").font(.headline)
+                Toggle("Focus on my attention (reads)", isOn: $focusMyExposure)
+                    .font(.caption)
+                    .toggleStyle(.switch)
+                factorChart()
+                Text("Factors from embeddings + tags (hybrid PCA/NMF). Stacked area shows topic/method mix by year.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if !summary.factorLabels.isEmpty {
+                    Text("Factor labels: " + summary.factorLabels.enumerated().map { "F\($0.offset): \($0.element)" }.joined(separator: " · "))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func noveltyChart(points: [NoveltyConsensusPoint]) -> some View {
+        let pts = points
+        Chart {
+            ForEach(pts) { pt in
+                PointMark(
+                    x: .value("Novelty", pt.novelty),
+                    y: .value("Consensus", pt.consensus)
+                )
+                .foregroundStyle(showFrontier && noveltyFrontier.contains(pt.id) ? .pink : .mint)
+                .annotation(position: .topLeading) {
+                    Text(pt.title.prefix(18))
+                        .font(.caption2)
+                }
+                .opacity(max(0.35, 1 - pt.novStd * 4))
+            }
+        }
+        .chartXAxisLabel("Novelty (z / combo / directional)")
+        .chartYAxisLabel("Consensus (z)")
+        .animation(.easeInOut(duration: 0.35), value: noveltyMode)
+        .animation(.easeInOut(duration: 0.35), value: selectedClusterFilter)
+        .animation(.easeInOut(duration: 0.35), value: showFrontier)
+        .frame(height: 220)
+    }
+
+    @ViewBuilder private func factorChart() -> some View {
+        let rows = factorExposures
+        Chart {
+            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                AreaMark(
+                    x: .value("Year", row.year),
+                    y: .value("Exposure", row.score)
+                )
+                .foregroundStyle(by: .value("Factor", factorLabel(for: row.factor)))
+                .interpolationMethod(.catmullRom)
+            }
+        }
+        .frame(height: 240)
+        .chartLegend(position: .bottom)
+        .animation(.easeInOut(duration: 0.4), value: rows.count)
+        .animation(.easeInOut(duration: 0.4), value: focusMyExposure)
+    }
+
+    @ViewBuilder private func influenceCard() -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Influential ideas").font(.headline)
+                ForEach(influenceTop, id: \.paper.id) { item in
+                    Text("\(item.paper.title) — score \(String(format: "%.3f", item.score))")
+                        .font(.caption)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func influenceTimelineCard() -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Idea flow timeline").font(.headline)
+                Chart {
+                    ForEach(influenceTimeline, id: \.paper.id) { item in
+                        PointMark(
+                            x: .value("Year", item.year ?? 0),
+                            y: .value("Influence", item.score)
+                        )
+                        .foregroundStyle(.orange)
+                        .annotation(position: .top) {
+                            Text(item.paper.title.prefix(16))
+                                .font(.caption2)
+                        }
+                    }
+                }
+                .frame(height: 200)
+                Text("Directed edges from older → newer similar claims; PageRank highlights semantic influence (not citations).")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder private func ideaRiverCard() -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Idea river (greedy storyline)").font(.headline)
+                ForEach(Array(ideaRiver.enumerated()), id: \.offset) { idx, p in
+                    HStack {
+                        Text("\(idx + 1). \(p.title)")
+                            .font(.caption)
+                            .transition(.scale.combined(with: .opacity))
+                        Spacer()
+                        if let year = p.year {
+                            Text("\(year)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    if idx < ideaRiver.count - 1 {
+                        Image(systemName: "arrow.down.right")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text("Start = most influential, then follow strongest downstream edge (older → newer claims).")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    @ViewBuilder private func counterfactualCard(_ summary: AnalyticsSummary) -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Counterfactual corpus").font(.headline)
+                let scenarios = summary.counterfactuals
+                if !scenarios.isEmpty {
+                    Picker("Scenario", selection: Binding(
+                        get: { selectedCounterfactual ?? scenarios.first?.name },
+                        set: { selectedCounterfactual = $0 }
+                    )) {
+                        ForEach(scenarios, id: \.name) { sc in
+                            Text(sc.name).tag(Optional(sc.name))
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    HStack {
+                        TextField("Custom cutoffs (e.g., 2010 2015 2020)", text: Binding(
+                            get: { customCutoffs },
+                            set: { customCutoffs = $0 }
+                        ))
+                        .textFieldStyle(.roundedBorder)
+                        Button("Recompute") {
+                            let nums = customCutoffs.split(separator: " ").compactMap { Int($0) }
+                            model.rebuildAnalyticsWithCutoffs(nums.isEmpty ? [2010, 2015, 2020] : nums)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(model.analyticsRebuildInFlight)
+                    }
+                    let stats = counterfactualStats
+                    Text("Papers kept: \(stats.paperCount)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(String(format: "Avg centrality: %.3f", stats.avgCentrality))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Text("Scenarios computed in Python (rebuild analytics to refresh).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Run analytics rebuild to compute counterfactual scenarios.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func recommendationCard(_ summary: AnalyticsSummary) -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Personal recommendations & confidence").font(.headline)
+                if !recommendationPapers.isEmpty {
+                    Text("Bandit picks:")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    ForEach(recommendationPapers.prefix(5)) { paper in
+                        HStack {
+                            Text("• \(paper.title)")
+                                .font(.caption2)
+                            Spacer()
+                            Button {
+                                model.recordRecommendationFeedback(paperID: paper.id, helpful: true)
+                            } label: { Image(systemName: "hand.thumbsup") }
+                                .buttonStyle(.borderless)
+                            Button {
+                                model.recordRecommendationFeedback(paperID: paper.id, helpful: false)
+                            } label: { Image(systemName: "hand.thumbsdown") }
+                                .buttonStyle(.borderless)
+                        }
+                    }
+                }
+                if let conf = summary.answerConfidence {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(String(format: "QA confidence %.0f%%", conf * 100))
+                            .font(.caption)
+                        ProgressView(value: conf)
+                            .tint(conf > 0.7 ? .green : .orange)
+                        if conf < 0.6 {
+                            Text("Low confidence — consider adding nearby papers:")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                            ForEach(closestPapersForUncertainty().prefix(3), id: \.id) { paper in
+                                Text("• \(paper.title)")
+                                    .font(.caption2)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func summarySection(_ summary: AnalyticsSummary) -> some View {
+        if !noveltyConsensus.isEmpty { noveltyCard() }
+        if !driftTop.isEmpty { driftCard() }
+        if !factorExposures.isEmpty { factorCard(summary) }
+        if !influenceTop.isEmpty { influenceCard() }
+        if !influenceTimeline.isEmpty { influenceTimelineCard() }
+        if !ideaRiver.isEmpty { ideaRiverCard() }
+        counterfactualCard(summary)
+        if !recommendationPapers.isEmpty || summary.answerConfidence != nil {
+            recommendationCard(summary)
+        }
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("Step 4 - Timeline & Drift")
-                        .font(.title2.bold())
-                    Text("See when topics heat up and how clusters evolve over time.")
+                    Text("Analytics")
+                        .font(.title.bold())
+                    Text("Position (novelty/consensus) + Flow (influence/drift) across your corpus.")
                         .foregroundStyle(.secondary)
 
                     GlassCard {
@@ -256,21 +653,10 @@ struct AnalyticsView: View {
                         }
                     }
 
-                    if !clusterAverages.isEmpty {
-                        GlassCard {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Cluster average year").font(.headline)
-                                ForEach(clusterAverages, id: \.name) { entry in
-                                    HStack {
-                                        Text(entry.name).font(.subheadline)
-                                        Spacer()
-                                        Text(String(format: "%.1f", entry.year))
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    // Position block
+                    Text("Position · novelty vs consensus")
+                        .font(.title3.weight(.semibold))
+                    Divider().opacity(0.35)
 
                     GlassCard {
                         VStack(alignment: .leading, spacing: 8) {
@@ -379,169 +765,7 @@ struct AnalyticsView: View {
                     }
 
                     if let summary = analyticsSummary {
-                        if !noveltyConsensus.isEmpty {
-                            GlassCard {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Novelty vs consensus").font(.headline)
-                                    Chart {
-                                        ForEach(noveltyConsensus) { pt in
-                                            PointMark(
-                                                x: .value("Novelty", pt.novelty),
-                                                y: .value("Centrality", pt.centrality)
-                                            )
-                                            .foregroundStyle(.mint)
-                                            .annotation(position: .topLeading) {
-                                                Text(pt.title.prefix(18))
-                                                    .font(.caption2)
-                                            }
-                                        }
-                                    }
-                                    .chartXAxisLabel("Novelty (farther from centroid)")
-                                    .chartYAxisLabel("Centrality (weighted degree)")
-                                    .frame(height: 220)
-                                    Text("Quadrants: high/high = anchors; high novelty/low centrality = hidden gems.")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-
-                        if !driftTop.isEmpty {
-                            GlassCard {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Topic drift (semantic motion)").font(.headline)
-                                    ForEach(driftTop, id: \.cluster) { entry in
-                                        Text("Cluster \(entry.cluster) drifted \(String(format: "%.3f", entry.drift)) in \(entry.year)")
-                                            .font(.caption)
-                                    }
-                                }
-                            }
-                        }
-
-                        if !factorExposureSample.isEmpty {
-                            GlassCard {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Factor exposures over time").font(.headline)
-                                    Toggle("Focus on my read/important papers", isOn: $focusMyExposure)
-                                        .font(.caption)
-                                        .toggleStyle(.switch)
-                                    Chart {
-                                        ForEach(factorExposureSample, id: \.year) { row in
-                                            LineMark(
-                                                x: .value("Year", row.year),
-                                                y: .value("Score", row.score),
-                                                series: .value("Factor", "F\(row.factor)")
-                                            )
-                                        }
-                                    }
-                                    .frame(height: 200)
-                                    Text("Factors come from embedding PCA; exposes your corpus/topic mix by year.")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-
-                        if !influenceTop.isEmpty {
-                            GlassCard {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Influential ideas").font(.headline)
-                                    ForEach(influenceTop, id: \.paper.id) { item in
-                                        Text("\(item.paper.title) — score \(String(format: "%.3f", item.score))")
-                                            .font(.caption)
-                                    }
-                                }
-                            }
-                        }
-
-                        GlassCard {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("Counterfactual corpus").font(.headline)
-                                if let scenarios = analyticsSummary?.counterfactuals, !scenarios.isEmpty {
-                                    Picker("Scenario", selection: Binding(
-                                        get: { selectedCounterfactual ?? scenarios.first?.name },
-                                        set: { selectedCounterfactual = $0 }
-                                    )) {
-                                        ForEach(scenarios, id: \.name) { sc in
-                                            Text(sc.name).tag(Optional(sc.name))
-                                        }
-                                    }
-                                    .pickerStyle(.menu)
-                                    HStack {
-                                        TextField("Custom cutoffs (e.g., 2010 2015 2020)", text: Binding(
-                                            get: { customCutoffs },
-                                            set: { customCutoffs = $0 }
-                                        ))
-                                        .textFieldStyle(.roundedBorder)
-                                        Button("Recompute") {
-                                            let nums = customCutoffs.split(separator: " ").compactMap { Int($0) }
-                                            model.rebuildAnalyticsWithCutoffs(nums.isEmpty ? [2010, 2015, 2020] : nums)
-                                        }
-                                        .buttonStyle(.borderedProminent)
-                                        .disabled(model.analyticsRebuildInFlight)
-                                    }
-                                    let stats = counterfactualStats
-                                    Text("Papers kept: \(stats.paperCount)")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                    Text(String(format: "Avg centrality: %.3f", stats.avgCentrality))
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                    Text("Scenarios computed in Python (rebuild analytics to refresh).")
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                } else {
-                                    Text("Run analytics rebuild to compute counterfactual scenarios.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-
-                        if !recommendationPapers.isEmpty || summary.answerConfidence != nil {
-                            GlassCard {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    Text("Personal recommendations & confidence").font(.headline)
-                                    if !recommendationPapers.isEmpty {
-                                        Text("Bandit picks:")
-                                            .font(.caption)
-                                            .foregroundStyle(.secondary)
-                                        ForEach(recommendationPapers.prefix(5)) { paper in
-                                            HStack {
-                                                Text("• \(paper.title)")
-                                                    .font(.caption2)
-                                                Spacer()
-                                                Button {
-                                                    model.recordRecommendationFeedback(paperID: paper.id, helpful: true)
-                                                } label: { Image(systemName: "hand.thumbsup") }
-                                                    .buttonStyle(.borderless)
-                                                Button {
-                                                    model.recordRecommendationFeedback(paperID: paper.id, helpful: false)
-                                                } label: { Image(systemName: "hand.thumbsdown") }
-                                                    .buttonStyle(.borderless)
-                                            }
-                                        }
-                                    }
-                                    if let conf = summary.answerConfidence {
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            Text(String(format: "QA confidence %.0f%%", conf * 100))
-                                                .font(.caption)
-                                            ProgressView(value: conf)
-                                                .tint(conf > 0.7 ? .green : .orange)
-                                            if conf < 0.6 {
-                                                Text("Low confidence — consider adding nearby papers:")
-                                                    .font(.caption2)
-                                                    .foregroundStyle(.secondary)
-                                                ForEach(closestPapersForUncertainty().prefix(3), id: \.id) { paper in
-                                                    Text("• \(paper.title)")
-                                                        .font(.caption2)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        summarySection(summary)
                     }
 
                     GlassCard {
@@ -678,6 +902,10 @@ struct AnalyticsView: View {
                     }
                 )
             }
+            .sheet(item: $selectedNoveltyPaper) { paper in
+                PaperDetailView(paper: paper)
+                    .environmentObject(model)
+            }
         }
     }
 }
@@ -728,6 +956,26 @@ private struct MethodCrossoverChart: View {
             (paper.keywords ?? []).joined(separator: " ").lowercased()
         ]
         return haystacks.contains { $0.contains(needle) }
+    }
+}
+
+@available(macOS 26, iOS 26, *)
+private struct FilterChip<Label: StringProtocol>: View {
+    let label: Label
+    let isOn: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.caption)
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .background(isOn ? Color.accentColor.opacity(0.18) : Color.white.opacity(0.06))
+                .foregroundStyle(isOn ? Color.accentColor : .primary)
+                .clipShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isOn)
     }
 }
 

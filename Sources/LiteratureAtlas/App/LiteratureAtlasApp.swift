@@ -19,7 +19,7 @@ struct UnsupportedView: View {
         VStack(spacing: 12) {
             Text("Requires Apple Intelligence")
                 .font(.title2.bold())
-            Text("This app needs macOS 15 or iPadOS 18 with on-device Foundation Models and NLContextualEmbedding.")
+            Text("This app needs macOS 26 or iOS/iPadOS 26 with on-device Foundation Models and NLContextualEmbedding.")
                 .multilineTextAlignment(.center)
                 .foregroundStyle(.secondary)
         }

@@ -15,13 +15,13 @@ struct VectorIndex {
 
     func query(_ needle: [Float], k: Int) -> [(index: Int, score: Float)] {
         guard needle.count == dim else { return [] }
+        guard k > 0 else { return [] }
         var scored: [(Int, Float)] = []
         for (idx, vec) in vectors.enumerated() where vec.count == dim {
             let score = cosineSimilarity(needle, vec)
             if score.isNaN { continue }
             scored.append((idx, score))
         }
-        let limited = max(1, k)
-        return Array(scored.sorted { $0.1 > $1.1 }.prefix(limited))
+        return Array(scored.sorted { $0.1 > $1.1 }.prefix(k))
     }
 }

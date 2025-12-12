@@ -34,7 +34,7 @@
 
 ## 5. Getting Started
 - **Prerequisites**
-  - Swift toolchain 6.0+, Xcode 16+ recommended; macOS 15 (or iPadOS 18) with on-device FoundationModels + NLContextualEmbedding support.
+- Swift toolchain 6.0+, Xcode 16+ recommended; macOS 26 (or iOS/iPadOS 26) with on-device FoundationModels + NLContextualEmbedding support.
   - Rust toolchain (stable) for `analytics/ffi` and `analytics/rust` builds.
   - Python 3.10+ with `pip` or `uv`; dependencies in `analytics/requirements.txt`.
   - Apple Silicon strongly recommended for on-device models.
@@ -66,7 +66,7 @@
   ```
   - Launches the SwiftUI app; use “Select Folder of PDFs” in the Ingest tab to start processing.
 - **iPadOS**
-  - Open the package in Xcode 16+, select an iPadOS 18+ device/simulator with Apple Intelligence support, and run the `LiteratureAtlas` target. Ensure `analytics/ffi` is built for the target architecture.
+- Open the package in Xcode 16+, select an iOS/iPadOS 26+ device/simulator with Apple Intelligence support, and run the `LiteratureAtlas` target. Ensure `analytics/ffi` is built for the target architecture.
 - **Analytics pipeline (optional but recommended)**
   ```bash
   source .venv/bin/activate  # if using venv
@@ -86,7 +86,7 @@
   - ANN edges (Rust): `cargo run --manifest-path analytics/rust/Cargo.toml --release -- --emb Output/analytics/paper_embeddings.parquet --out Output/analytics/ann_edges.json --k 8`
 
 ## 7. Testing & QA
-- Swift tests (macOS 15+/Swift 6 required):
+- Swift tests (macOS 26+/Swift 6 required):
   ```bash
   swift test
   ```
@@ -116,8 +116,8 @@
 
 ## 10. Deployment & Environments
 - No Docker/Helm manifests provided; distribute as a SwiftPM/Xcode app. Ensure `libatlas_ffi` ships with the binary (or adjust `Package.swift` linker flags to your install path).
-- macOS build uses `-Lanalytics/ffi/target/release -latlas_ffi` (see `Package.swift`); rebuild the Rust lib per architecture before shipping.
-- iOS builds require embedding the static library from `analytics/ffi` if used on device; otherwise the Swift fallback search path runs without FFI.
+- macOS build links `atlas_ffi` from `analytics/ffi/target/release` (see `Package.swift`); rebuild the Rust lib per architecture before shipping.
+- iOS builds default to the Swift fallback (no FFI). To enable FFI on iOS, add iOS linker settings and define `ATLAS_FFI_LINKED` for iOS in `Package.swift` after building a static library.
 
 ## 11. Security & Permissions
 - All processing is offline: PDFs stay local, summaries/embeddings use on-device models, and analytics run locally.
@@ -131,4 +131,4 @@
 - Keep new data outputs inside `Output/` and avoid committing large binaries unless necessary.
 
 ## 14. License
-- No explicit license detected in the repository.
+- MIT License (see `LICENSE`).

@@ -1,4 +1,5 @@
 import Foundation
+@preconcurrency import NaturalLanguage
 
 // MARK: - Claim-level structures
 
@@ -114,17 +115,13 @@ enum ClaimExtractor {
 
     private static func splitIntoSentences(text: String) -> [String] {
         var results: [String] = []
-        var current = ""
-        for char in text {
-            current.append(char)
-            if char == "." || char == "!" || char == "?" {
-                let trimmed = current.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !trimmed.isEmpty { results.append(trimmed) }
-                current = ""
-            }
+        let tokenizer = NLTokenizer(unit: .sentence)
+        tokenizer.string = text
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            let sentence = text[range].trimmingCharacters(in: .whitespacesAndNewlines)
+            if !sentence.isEmpty { results.append(sentence) }
+            return true
         }
-        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty { results.append(tail) }
         return results
     }
 
