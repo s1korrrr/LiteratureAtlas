@@ -25,7 +25,8 @@ void atlas_free_index(void* index_ptr);
 // Query top-k neighbors. Returns number of results written to out_ptr.
 uint32_t atlas_query_index(void* index_ptr, const float* query_ptr, uint32_t k, AtlasSearchResult* out_ptr);
 
-// Betweenness centrality on an undirected weighted graph. out_ptr must hold n_nodes floats.
+// Betweenness centrality on an undirected weighted graph (edge weight interpreted as non-negative cost).
+// out_ptr must hold n_nodes floats.
 uint32_t atlas_betweenness(uint32_t n_nodes, uint32_t n_edges, const AtlasEdge* edges_ptr, float* out_ptr);
 
 // Connected components; out_ptr must hold n_nodes u32 ids; returns component count.

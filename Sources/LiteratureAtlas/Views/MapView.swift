@@ -1,4 +1,5 @@
 import SwiftUI
+import FoundationModels
 
 private enum MapPalette {
     static let backdrop = LinearGradient(
@@ -28,8 +29,8 @@ private enum MapPalette {
         endRadius: 220
     )
 
-    static let panel = Color.white.opacity(0.06)
-    static let panelStroke = Color.white.opacity(0.12)
+    static let panel = Color.white.opacity(0.08)
+    static let panelStroke = Color.white.opacity(0.14)
 
     static func nodeGradient(for index: Int) -> LinearGradient {
         let palette: [[Color]] = [
@@ -79,25 +80,81 @@ private enum ZoomLevel: Int, CaseIterable {
 }
 
 @available(macOS 26, iOS 26, *)
+private struct MapBackdropView: View {
+    @State private var phase: Double = 0
+
+    var body: some View {
+        MapPalette.backdrop
+            .overlay(
+                AngularGradient(
+                    colors: [
+                        Color.purple.opacity(0.22),
+                        Color.cyan.opacity(0.18),
+                        Color.pink.opacity(0.20),
+                        Color.purple.opacity(0.22)
+                    ],
+                    center: .center
+                )
+                .blur(radius: 160)
+                .opacity(0.35)
+                .rotationEffect(.degrees(phase * 360))
+                .blendMode(.screen)
+            )
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .onAppear {
+                guard phase == 0 else { return }
+                withAnimation(.linear(duration: 28).repeatForever(autoreverses: false)) {
+                    phase = 1
+                }
+            }
+    }
+}
+
+@available(macOS 26, iOS 26, *)
 struct MapView: View {
     @EnvironmentObject private var model: AppModel
     @State private var resolution: ClusterResolution = .medium
     @State private var lens: MapLens = .standard
     @State private var zoomLevel: ZoomLevel = .mega
-    @State private var selectedMega: Cluster?
-    @State private var selectedSubtopic: Cluster?
+    @State private var selectedMegaID: Int?
+    @State private var selectedSubtopicID: Int?
     @State private var selectedClusterIDs: Set<Int> = []
+    @State private var selectedPaper: Paper?
+    @State private var paperHighlights: [UUID: PaperNoveltyScore] = [:]
+    @State private var isNamingSubtopics: Bool = false
+    @State private var isNamingMegaTopics: Bool = false
     @State private var debateText: String = ""
     @State private var showDebate: Bool = false
+    @State private var showGlossary: Bool = false
+    @State private var showExportAlert: Bool = false
+    @State private var exportMessage: String = ""
     @State private var hypothetical: HypotheticalPaper?
     @State private var showHypothetical: Bool = false
+
+    private var selectedMegaCluster: Cluster? {
+        if let id = selectedMegaID {
+            return model.megaClusters.first(where: { $0.id == id })
+        }
+        return nil
+    }
+
+    private var selectedSubtopicCluster: Cluster? {
+        if let id = selectedSubtopicID {
+            if let mega = selectedMegaCluster, let sub = mega.subclusters?.first(where: { $0.id == id }) {
+                return sub
+            }
+            return model.clusters.first(where: { $0.id == id })
+        }
+        return nil
+    }
 
     private var activeClusters: [Cluster] {
         switch zoomLevel {
         case .mega:
             return model.lensAdjustedClusters(model.megaClusters, lens: lens)
         case .topics:
-            let base = (selectedMega ?? model.megaClusters.first)?.subclusters ?? []
+            let base = (selectedMegaCluster ?? model.megaClusters.first)?.subclusters ?? []
             return model.lensAdjustedClusters(base, lens: lens)
         case .papers:
             return []
@@ -106,26 +163,20 @@ struct MapView: View {
 
     private var activePapers: [Paper] {
         guard zoomLevel == .papers else { return [] }
-        guard let sub = selectedSubtopic ?? selectedMega?.subclusters?.first else { return [] }
-        return model.papers.filter { $0.clusterIndex == sub.id }
+        guard let sub = selectedSubtopicCluster else { return [] }
+        return model.explorationPapers.filter { $0.clusterIndex == sub.id }
     }
 
     private var activePaperDriftVector: (dx: Double, dy: Double)? {
-        guard let sub = selectedSubtopic ?? selectedMega?.subclusters?.first else { return nil }
+        guard let sub = selectedSubtopicCluster else { return nil }
         guard let drift = model.analyticsSummary?.drift else { return nil }
         return drift.last(where: { $0.clusterID == sub.id }).map { ($0.dx ?? 0, $0.dy ?? 0) }
-    }
-
-    private var paperHighlights: [UUID: PaperNoveltyScore] {
-        let ids = Set(activePapers.map { $0.id })
-        let scores = model.noveltyHighlights(neighbors: 3)
-        return Dictionary(uniqueKeysWithValues: scores.filter { ids.contains($0.paperID) }.map { ($0.paperID, $0) })
     }
 
     var body: some View {
         NavigationStack {
             ZStack {
-                MapPalette.backdrop.ignoresSafeArea()
+                MapBackdropView()
 
                 VStack(alignment: .leading, spacing: 14) {
                     header
@@ -137,35 +188,108 @@ struct MapView: View {
                     } else {
                         controlDeck
 
-                        if zoomLevel == .topics, let mega = selectedMega {
-                            breadcrumb(for: mega)
+                        if zoomLevel == .mega, !model.megaClusters.isEmpty {
+                            HStack {
+                                Spacer()
+                                Button {
+                                    guard !isNamingMegaTopics else { return }
+                                    isNamingMegaTopics = true
+                                    Task {
+                                        await model.nameMegaTopicsWithAI()
+                                        await MainActor.run { isNamingMegaTopics = false }
+                                    }
+                                } label: {
+                                    if isNamingMegaTopics {
+                                        Label("Naming…", systemImage: "sparkles")
+                                    } else {
+                                        Label("Name mega-topics", systemImage: "sparkles")
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(isNamingMegaTopics)
+                                .contextMenu {
+                                    Button("Force AI re-name mega-topics") {
+                                        guard !isNamingMegaTopics else { return }
+                                        isNamingMegaTopics = true
+                                        Task {
+                                            await model.nameMegaTopicsWithAI(force: true)
+                                            await MainActor.run { isNamingMegaTopics = false }
+                                        }
+                                    }
+                                }
+                            }
                         }
-                    if zoomLevel == .papers, let sub = selectedSubtopic {
-                        paperBreadcrumb(for: sub)
-                    } else if zoomLevel == .papers {
-                        Text("Zoomed to papers: pick a subtopic node first.")
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.7))
-                    }
 
-                    if zoomLevel != .papers && activeClusters.isEmpty {
-                        Text("Run clustering to see the map.")
-                            .foregroundStyle(.white.opacity(0.7))
-                        Spacer()
-                    } else if zoomLevel == .papers {
-                        PaperScatterView(papers: activePapers, highlights: paperHighlights, driftVector: activePaperDriftVector)
+                        if zoomLevel == .topics, let mega = selectedMegaCluster {
+                            HStack {
+                                breadcrumb(for: mega)
+                                Spacer()
+                                Button {
+                                    guard !isNamingSubtopics else { return }
+                                    isNamingSubtopics = true
+                                    Task {
+                                        await model.nameSubtopicsWithAI(forMegaID: mega.id)
+                                        await MainActor.run { isNamingSubtopics = false }
+                                    }
+                                } label: {
+                                    if isNamingSubtopics {
+                                        Label("Naming…", systemImage: "sparkles")
+                                    } else {
+                                        Label("Name subtopics", systemImage: "sparkles")
+                                    }
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(isNamingSubtopics)
+                                .contextMenu {
+                                    Button("Force AI re-name subtopics") {
+                                        guard !isNamingSubtopics else { return }
+                                        isNamingSubtopics = true
+                                        Task {
+                                            await model.nameSubtopicsWithAI(forMegaID: mega.id, force: true)
+                                            await MainActor.run { isNamingSubtopics = false }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if zoomLevel == .papers, let sub = selectedSubtopicCluster {
+                            paperBreadcrumb(for: sub)
+                        } else if zoomLevel == .papers {
+                            Text("Zoomed to papers: pick a subtopic node first.")
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.7))
+                        }
+
+                        if zoomLevel != .papers && activeClusters.isEmpty {
+                            Text("Run clustering to see the map.")
+                                .foregroundStyle(.white.opacity(0.7))
+                            Spacer()
+                        } else if zoomLevel == .papers {
+                            PaperScatterView(
+                                papers: activePapers,
+                                highlights: paperHighlights,
+                                driftVector: activePaperDriftVector,
+                                onSelectPaper: { paper in
+                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                        selectedPaper = paper
+                                    }
+                                }
+                            )
                             .frame(minHeight: 360)
-                    } else {
-                        ClusterMapAndSidebar(
-                            clusters: activeClusters,
-                            selectedClusterIDs: $selectedClusterIDs,
-                            isZoomed: zoomLevel == .topics,
-                            showBridging: zoomLevel == .topics,
+                            .transition(.opacity.combined(with: .scale(scale: 0.985)))
+                        } else {
+                            ClusterMapAndSidebar(
+                                clusters: activeClusters,
+                                selectedClusterIDs: $selectedClusterIDs,
+                                isZoomed: zoomLevel == .topics,
+                                showBridging: zoomLevel == .topics,
                                 onZoomOut: zoomLevel == .mega ? nil : {
-                                    zoomLevel = .mega
-                                    selectedMega = nil
-                                    selectedSubtopic = nil
-                                    selectedClusterIDs.removeAll()
+                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                        zoomLevel = .mega
+                                        selectedMegaID = nil
+                                        selectedSubtopicID = nil
+                                        selectedClusterIDs.removeAll()
+                                    }
                                 },
                                 onZoom: zoomLevel == .mega ? { cluster in
                                     selectMega(cluster)
@@ -179,6 +303,7 @@ struct MapView: View {
                                 },
                                 lensLabel: lens.label
                             )
+                            .transition(.opacity.combined(with: .scale(scale: 0.985)))
                         }
 
                         if selectedClusterIDs.count == 2 {
@@ -188,12 +313,26 @@ struct MapView: View {
                                     Text("Compare & brainstorm").font(.headline).foregroundStyle(.white)
                                     HStack {
                                         Button {
-                                            debateText = model.simulateClusterDebate(firstID: pair[0], secondID: pair[1])
                                             showDebate = true
+                                            debateText = "Generating…"
+                                            Task {
+                                                let text = await model.generateDebateBetweenClusters(firstID: pair[0], secondID: pair[1], rounds: 4, useAI: false)
+                                                await MainActor.run { debateText = text }
+                                            }
                                         } label: {
                                             Label("Simulate debate", systemImage: "person.3.sequence")
                                         }
                                         .buttonStyle(.borderedProminent)
+                                        .contextMenu {
+                                            Button("Generate debate (AI)") {
+                                                showDebate = true
+                                                debateText = "Generating…"
+                                                Task {
+                                                    let text = await model.generateDebateBetweenClusters(firstID: pair[0], secondID: pair[1], rounds: 4, useAI: true)
+                                                    await MainActor.run { debateText = text }
+                                                }
+                                            }
+                                        }
                                         Button {
                                             if let ghost = model.generateWhatIfPaper(for: pair) {
                                                 hypothetical = ghost
@@ -210,8 +349,41 @@ struct MapView: View {
                     }
                 }
                 .padding()
+                .animation(.spring(response: 0.35, dampingFraction: 0.85), value: zoomLevel)
+                .task(id: PaperHighlightTaskKey(
+                    zoomLevel: zoomLevel,
+                    subtopicID: selectedSubtopicID,
+                    papersCount: model.papers.count,
+                    yearFilterEnabled: model.yearFilterEnabled,
+                    yearFilterStart: model.yearFilterStart,
+                    yearFilterEnd: model.yearFilterEnd
+                )) {
+                    guard zoomLevel == .papers, let sub = selectedSubtopicCluster else {
+                        await MainActor.run { paperHighlights = [:] }
+                        return
+                    }
+                    let papers = activePapers
+                    guard papers.count >= 2 else {
+                        await MainActor.run { paperHighlights = [:] }
+                        return
+                    }
+
+                    let clusterSnapshot = sub
+                    let papersSnapshot = papers
+                    let highlights = await Task.detached(priority: .userInitiated) {
+                        let scores = TemporalAnalytics.noveltyScores(papers: papersSnapshot, clusters: [clusterSnapshot], neighbors: 3)
+                        return Dictionary(uniqueKeysWithValues: scores.map { ($0.paperID, $0) })
+                    }.value
+
+                    await MainActor.run { paperHighlights = highlights }
+                }
             }
             .navigationTitle("Map")
+            .alert("Export", isPresented: $showExportAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(exportMessage)
+            }
             .sheet(isPresented: $showDebate) {
                 NavigationStack {
                     ScrollView {
@@ -253,7 +425,64 @@ struct MapView: View {
                     .frame(minWidth: 420, minHeight: 360)
                 }
             }
+            .sheet(isPresented: $showGlossary) {
+                TopicGlossaryView(
+                    onSelectMega: { cluster in
+                        selectMega(cluster)
+                    },
+                    onSelectSubtopic: { cluster in
+                        selectSubtopic(cluster)
+                    }
+                )
+            }
+            #if os(iOS)
+            .sheet(item: $selectedPaper) { paper in
+                NavigationStack {
+                    PaperDetailView(paper: paper)
+                        .navigationTitle("Paper")
+                        .toolbar {
+                            ToolbarItem(placement: .primaryAction) {
+                                Button("Close") { selectedPaper = nil }
+                            }
+                        }
+                }
+                #if os(iOS)
+                .presentationDetents([.medium, .large])
+                .presentationDragIndicator(.visible)
+                #endif
+                .frame(minWidth: 520, minHeight: 620)
+            }
+            #endif
         }
+        #if os(macOS)
+        .overlay {
+            if let paper = selectedPaper {
+                DismissibleOverlay(onDismiss: { selectedPaper = nil }) {
+                    NavigationStack {
+                        PaperDetailView(paper: paper, onClose: { selectedPaper = nil })
+                            .environmentObject(model)
+                            .toolbar {
+                                ToolbarItem(placement: .primaryAction) {
+                                    Button {
+                                        selectedPaper = nil
+                                    } label: {
+                                        Label("Close", systemImage: "xmark")
+                                    }
+                                }
+                            }
+                    }
+                    .frame(minWidth: 640, idealWidth: 920, maxWidth: 980, minHeight: 620, idealHeight: 820, maxHeight: 920)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 26, style: .continuous)
+                            .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                    )
+                    .padding(24)
+                }
+                .zIndex(1000)
+            }
+        }
+        #endif
     }
 
     private var header: some View {
@@ -263,19 +492,58 @@ struct MapView: View {
                     .font(.title.bold())
                     .foregroundStyle(.white)
                 HStack(spacing: 8) {
-                    StatPill(label: "Papers", value: "\(model.papers.count)")
+                    let papersValue: String = {
+                        guard model.yearFilterEnabled else { return "\(model.papers.count)" }
+                        return "\(model.explorationPapers.count)/\(model.papers.count)"
+                    }()
+                    StatPill(label: "Papers", value: papersValue)
+                    if model.yearFilterEnabled, let range = model.effectiveYearRange {
+                        StatPill(label: "Years", value: "\(range.lowerBound)–\(range.upperBound)")
+                    }
                     StatPill(label: "Clusters", value: "\(max(model.megaClusters.count, model.clusters.count))")
                     StatPill(label: "Lens", value: lens.label)
                 }
             }
             Spacer()
-            if model.isClustering {
-                VStack(alignment: .trailing, spacing: 4) {
-                    ProgressView(value: model.clusteringProgress)
-                        .frame(width: 140)
-                    Text(String(format: "%.0f%%", model.clusteringProgress * 100))
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                Button {
+                    showGlossary = true
+                } label: {
+                    Label("Glossary", systemImage: "text.book.closed")
+                }
+                .buttonStyle(.bordered)
+
+                if model.yearFilterEnabled {
+                    Button {
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                            model.resetYearFilter()
+                        }
+                    } label: {
+                        Label("Clear years", systemImage: "calendar.badge.minus")
+                    }
+                    .buttonStyle(.bordered)
+                }
+
+                Button {
+                    if let result = model.exportGalaxyArtifacts() {
+                        exportMessage = "Wrote:\n\(result.jsonURL.lastPathComponent)\n\(result.reportURL.lastPathComponent)"
+                    } else {
+                        exportMessage = "Nothing to export yet. Run clustering first."
+                    }
+                    showExportAlert = true
+                } label: {
+                    Label("Export", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+
+                if model.isClustering {
+                    VStack(alignment: .trailing, spacing: 4) {
+                        ProgressView(value: model.clusteringProgress)
+                            .frame(width: 140)
+                        Text(String(format: "%.0f%%", model.clusteringProgress * 100))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
         }
@@ -379,10 +647,12 @@ struct MapView: View {
     private func breadcrumb(for cluster: Cluster) -> some View {
         HStack(spacing: 6) {
             Button {
-                zoomLevel = .mega
-                selectedMega = nil
-                selectedSubtopic = nil
-                selectedClusterIDs.removeAll()
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    zoomLevel = .mega
+                    selectedMegaID = nil
+                    selectedSubtopicID = nil
+                    selectedClusterIDs.removeAll()
+                }
             } label: {
                 Label("All topics", systemImage: "circle.grid.3x3")
             }
@@ -400,8 +670,9 @@ struct MapView: View {
     private func paperBreadcrumb(for cluster: Cluster) -> some View {
         HStack(spacing: 6) {
             Button {
-                zoomLevel = .topics
-                selectedSubtopic = nil
+                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                    zoomLevel = .topics
+                }
             } label: {
                 Label("Subtopics", systemImage: "circle.grid.3x3")
             }
@@ -418,8 +689,8 @@ struct MapView: View {
 
     private func triggerClustering() {
         selectedClusterIDs.removeAll()
-        selectedMega = nil
-        selectedSubtopic = nil
+        selectedMegaID = nil
+        selectedSubtopicID = nil
         zoomLevel = .mega
         Task {
             await model.buildMultiScaleGalaxy(level0Range: 5...8, level1Range: resolution.subtopicRange)
@@ -427,17 +698,30 @@ struct MapView: View {
     }
 
     private func selectMega(_ cluster: Cluster) {
-        selectedMega = cluster
-        selectedSubtopic = nil
-        selectedClusterIDs = [cluster.id]
-        zoomLevel = .topics
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            selectedMegaID = cluster.id
+            selectedSubtopicID = nil
+            selectedClusterIDs = [cluster.id]
+            zoomLevel = .topics
+        }
     }
 
     private func selectSubtopic(_ cluster: Cluster) {
-        selectedSubtopic = cluster
-        selectedClusterIDs = [cluster.id]
-        zoomLevel = .papers
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            selectedSubtopicID = cluster.id
+            selectedClusterIDs = [cluster.id]
+            zoomLevel = .papers
+        }
     }
+}
+
+private struct PaperHighlightTaskKey: Hashable {
+    let zoomLevel: ZoomLevel
+    let subtopicID: Int?
+    let papersCount: Int
+    let yearFilterEnabled: Bool
+    let yearFilterStart: Int
+    let yearFilterEnd: Int
 }
 
 @available(macOS 26, iOS 26, *)
@@ -558,137 +842,156 @@ struct ClusterGraphView: View {
     var driftMagnitudes: [Int: Double] = [:]
     var driftVectors: [Int: (dx: Double, dy: Double)] = [:]
     var ideaEdges: [(Int, Int, Double)] = []
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var layoutSignature: String {
+        clusters.map { cluster in
+            guard let layout = cluster.layoutPosition else { return "\(cluster.id):nil" }
+            return "\(cluster.id):\(Int(layout.x * 1000)):\(Int(layout.y * 1000))"
+        }.joined(separator: "|")
+    }
 
     var body: some View {
-        GeometryReader { geo in
-            let size = geo.size
-            let center = CGPoint(x: size.width / 2, y: size.height / 2)
-            let radius = min(size.width, size.height) / 2 - 80
+        TimelineView(.periodic(from: .now, by: reduceMotion ? 3600 : 1.0 / 18.0)) { timeline in
+            GeometryReader { geo in
+                let size = geo.size
+                let center = CGPoint(x: size.width / 2, y: size.height / 2)
+                let radius = min(size.width, size.height) / 2 - 80
+                let time = timeline.date.timeIntervalSinceReferenceDate
+                let wobble = reduceMotion ? 0 : min(10, radius * 0.03)
+                let spin = reduceMotion ? 0 : time * 0.015
+                let positions = Dictionary(uniqueKeysWithValues: clusters.enumerated().map { idx, cluster in
+                    (cluster.id, position(for: cluster, fallbackIndex: idx, total: clusters.count, center: center, radius: radius, time: time, wobble: wobble))
+                })
 
-            ZStack {
-                RoundedRectangle(cornerRadius: 24)
-                    .fill(MapPalette.canvas)
-                    .overlay(MapPalette.glow)
-                    .overlay(
-                        AngularGradient(
-                            colors: [.clear, Color.white.opacity(0.1), .clear],
-                            center: .center
+                ZStack {
+                    RoundedRectangle(cornerRadius: 24)
+                        .fill(MapPalette.canvas)
+                        .overlay(MapPalette.glow)
+                        .overlay(
+                            AngularGradient(
+                                colors: [.clear, Color.white.opacity(0.12), .clear],
+                                center: .center
+                            )
+                            .blur(radius: 80)
+                            .rotationEffect(.radians(spin))
+                            .blendMode(.screen)
                         )
-                        .blur(radius: 80)
-                    )
-                    .overlay(
-                        ZStack {
-                            ForEach(0..<6, id: \.self) { idx in
-                                Circle()
-                                    .stroke(Color.white.opacity(0.05), lineWidth: 1)
-                                    .frame(width: radius * 2 * CGFloat(0.3 + 0.1 * Double(idx)), height: radius * 2 * CGFloat(0.3 + 0.1 * Double(idx)))
-                                    .offset(y: 8)
+                        .overlay(
+                            ZStack {
+                                ForEach(0..<6, id: \.self) { idx in
+                                    Circle()
+                                        .stroke(Color.white.opacity(0.05), lineWidth: 1)
+                                        .frame(width: radius * 2 * CGFloat(0.3 + 0.1 * Double(idx)), height: radius * 2 * CGFloat(0.3 + 0.1 * Double(idx)))
+                                        .offset(y: 8)
+                                }
                             }
-                        }
-                    )
-                    .shadow(color: .black.opacity(0.28), radius: 20, x: 0, y: 12)
+                        )
+                        .shadow(color: .black.opacity(0.28), radius: 20, x: 0, y: 12)
 
-                if clusters.isEmpty {
-                    Text("No clusters yet.")
-                        .foregroundStyle(.white.opacity(0.7))
-                } else {
-                    VStack {
-                        HStack {
-                            Text("Lens: \(lensLabel)")
-                                .font(.caption.bold())
-                                .foregroundStyle(.white.opacity(0.8))
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(Color.white.opacity(0.08), in: Capsule())
+                    if clusters.isEmpty {
+                        Text("No clusters yet.")
+                            .foregroundStyle(.white.opacity(0.7))
+                    } else {
+                        VStack {
+                            HStack {
+                                Text("Lens: \(lensLabel)")
+                                    .font(.caption.bold())
+                                    .foregroundStyle(.white.opacity(0.8))
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 6)
+                                    .background(Color.white.opacity(0.08), in: Capsule())
+                                Spacer()
+                            }
+                            .padding(12)
                             Spacer()
                         }
-                        .padding(12)
-                        Spacer()
-                    }
 
-                    if selectedClusterIDs.count == 2 {
-                        let ids = Array(selectedClusterIDs)
-                        if let firstIndex = clusters.firstIndex(where: { $0.id == ids[0] }),
-                           let secondIndex = clusters.firstIndex(where: { $0.id == ids[1] }) {
-                            let p1 = position(for: clusters[firstIndex], fallbackIndex: firstIndex, total: clusters.count, center: center, radius: radius)
-                            let p2 = position(for: clusters[secondIndex], fallbackIndex: secondIndex, total: clusters.count, center: center, radius: radius)
-                            Path { path in
-                                path.move(to: p1)
-                                path.addLine(to: p2)
-                            }
-                            .stroke(style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [6, 6]))
-                            .foregroundColor(.yellow.opacity(0.9))
-                        }
-                    }
-
-                    // Idea-flow edges
-                    ForEach(Array(ideaEdges.enumerated()), id: \.offset) { _, edge in
-                        if let sIdx = clusters.firstIndex(where: { $0.id == edge.0 }),
-                           let dIdx = clusters.firstIndex(where: { $0.id == edge.1 }) {
-                            let p1 = position(for: clusters[sIdx], fallbackIndex: sIdx, total: clusters.count, center: center, radius: radius)
-                            let p2 = position(for: clusters[dIdx], fallbackIndex: dIdx, total: clusters.count, center: center, radius: radius)
-                            let width = max(1, min(4, CGFloat(edge.2) * 0.5))
-                            Path { path in
-                                path.move(to: p1)
-                                path.addLine(to: p2)
-                            }
-                            .stroke(Color.orange.opacity(0.35), style: StrokeStyle(lineWidth: width, lineCap: .round))
-                        }
-                    }
-
-                    ForEach(Array(clusters.enumerated()), id: \.1.id) { index, cluster in
-                        let pos = position(for: cluster, fallbackIndex: index, total: clusters.count, center: center, radius: radius)
-                        ClusterNodeView(cluster: cluster, isSelected: selectedClusterIDs.contains(cluster.id))
-                            .position(pos)
-                            .onTapGesture {
-                                if selectedClusterIDs.contains(cluster.id) {
-                                    selectedClusterIDs.remove(cluster.id)
-                                } else {
-                                    if selectedClusterIDs.count >= 2 {
-                                        selectedClusterIDs.removeAll()
-                                    }
-                                    selectedClusterIDs.insert(cluster.id)
+                        if selectedClusterIDs.count == 2 {
+                            let ids = Array(selectedClusterIDs)
+                            if let p1 = positions[ids[0]], let p2 = positions[ids[1]] {
+                                Path { path in
+                                    path.move(to: p1)
+                                    path.addLine(to: p2)
                                 }
-                                onSelect?(cluster)
+                                .stroke(style: StrokeStyle(lineWidth: 2, lineCap: .round, dash: [6, 6]))
+                                .foregroundColor(.yellow.opacity(0.9))
                             }
+                        }
 
-                        if let drift = driftMagnitudes[cluster.id], drift > 0, let layout = cluster.layoutPosition {
-                            let vec = driftVectors[cluster.id] ?? (dx: Double(cos(hashAngle(for: cluster.id))), dy: Double(sin(hashAngle(for: cluster.id))))
-                            let length = CGFloat(min(drift, 0.6)) * radius * 0.35
-                            let start = CGPoint(
-                                x: center.x + (CGFloat(layout.x) - 0.5) * radius * 2,
-                                y: center.y + (CGFloat(layout.y) - 0.5) * radius * 2
-                            )
-                            let end = CGPoint(
-                                x: start.x + length * CGFloat(vec.dx),
-                                y: start.y + length * CGFloat(vec.dy)
-                            )
-                            ArrowShape(start: start, end: end)
-                                .stroke(Color.cyan.opacity(0.8), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        // Idea-flow edges
+                        ForEach(Array(ideaEdges.enumerated()), id: \.offset) { _, edge in
+                            if let p1 = positions[edge.0], let p2 = positions[edge.1] {
+                                let width = max(1, min(4, CGFloat(edge.2) * 0.5))
+                                Path { path in
+                                    path.move(to: p1)
+                                    path.addLine(to: p2)
+                                }
+                                .stroke(Color.orange.opacity(0.35), style: StrokeStyle(lineWidth: width, lineCap: .round))
+                            }
+                        }
+
+                        ForEach(clusters, id: \.id) { cluster in
+                            if let pos = positions[cluster.id] {
+                                ClusterNodeView(cluster: cluster, isSelected: selectedClusterIDs.contains(cluster.id))
+                                    .position(pos)
+                                    .onTapGesture {
+                                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                            if selectedClusterIDs.contains(cluster.id) {
+                                                selectedClusterIDs.remove(cluster.id)
+                                            } else {
+                                                if selectedClusterIDs.count >= 2 {
+                                                    selectedClusterIDs.removeAll()
+                                                }
+                                                selectedClusterIDs.insert(cluster.id)
+                                            }
+                                        }
+                                        onSelect?(cluster)
+                                    }
+
+                                if let drift = driftMagnitudes[cluster.id], drift > 0 {
+                                    let vec = driftVectors[cluster.id] ?? (dx: Double(cos(hashAngle(for: cluster.id))), dy: Double(sin(hashAngle(for: cluster.id))))
+                                    let length = CGFloat(min(drift, 0.6)) * radius * 0.35
+                                    let end = CGPoint(
+                                        x: pos.x + length * CGFloat(vec.dx),
+                                        y: pos.y + length * CGFloat(vec.dy)
+                                    )
+                                    ArrowShape(start: pos, end: end)
+                                        .stroke(Color.cyan.opacity(0.75), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                                }
+                            }
                         }
                     }
                 }
+                .animation(.spring(response: 0.55, dampingFraction: 0.85), value: layoutSignature)
             }
         }
     }
 
-    private func position(for cluster: Cluster, fallbackIndex: Int, total: Int, center: CGPoint, radius: CGFloat) -> CGPoint {
+    private func position(for cluster: Cluster, fallbackIndex: Int, total: Int, center: CGPoint, radius: CGFloat, time: TimeInterval, wobble: CGFloat) -> CGPoint {
+        let base: CGPoint
         if let layout = cluster.layoutPosition {
             let x = center.x + (CGFloat(layout.x) - 0.5) * radius * 2
             let y = center.y + (CGFloat(layout.y) - 0.5) * radius * 2
-            return CGPoint(x: x, y: y)
+            base = CGPoint(x: x, y: y)
+        } else {
+            let angle = 2 * Double.pi * Double(fallbackIndex) / Double(max(total, 1))
+            base = CGPoint(
+                x: center.x + radius * CGFloat(cos(angle)),
+                y: center.y + radius * CGFloat(sin(angle))
+            )
         }
 
-        let angle = 2 * Double.pi * Double(fallbackIndex) / Double(max(total, 1))
-        return CGPoint(
-            x: center.x + radius * CGFloat(cos(angle)),
-            y: center.y + radius * CGFloat(sin(angle))
-        )
+        guard wobble > 0 else { return base }
+        let phase = CGFloat(time * 0.9) + hashAngle(for: cluster.id)
+        let dx = wobble * CGFloat(cos(phase))
+        let dy = wobble * CGFloat(sin(phase * 1.18))
+        return CGPoint(x: base.x + dx, y: base.y + dy)
     }
 
     private func hashAngle(for id: Int) -> CGFloat {
         // Deterministic pseudo-angle per cluster id
-        let seed = UInt64(id &* 6364136223846793005 &+ 1)
+        let seed = UInt64(truncatingIfNeeded: id) &* 6364136223846793005 &+ 1
         let frac = Double(seed % 10_000) / 10_000.0
         return CGFloat(frac * 2 * Double.pi)
     }
@@ -696,12 +999,17 @@ struct ClusterGraphView: View {
 
 @available(macOS 26, iOS 26, *)
 struct ClusterNodeView: View {
+    @EnvironmentObject private var model: AppModel
     let cluster: Cluster
     let isSelected: Bool
 
+    private var paperCount: Int {
+        model.paperCount(for: cluster)
+    }
+
     private var size: CGFloat {
         let base: CGFloat = 130
-        let growth = CGFloat(min(cluster.memberPaperIDs.count, 14)) * 4
+        let growth = CGFloat(min(paperCount, 14)) * 4
         return base + growth
     }
 
@@ -712,7 +1020,7 @@ struct ClusterNodeView: View {
                 .multilineTextAlignment(.center)
                 .lineLimit(2)
                 .foregroundStyle(.white)
-            Text("\(cluster.memberPaperIDs.count) papers")
+            Text("\(paperCount) papers")
                 .font(.caption.bold())
                 .foregroundStyle(.white.opacity(0.8))
         }
@@ -736,6 +1044,7 @@ struct ClusterNodeView: View {
         )
         .shadow(color: Color.black.opacity(isSelected ? 0.45 : 0.22), radius: isSelected ? 18 : 10, x: 0, y: 8)
         .scaleEffect(isSelected ? 1.06 : 1.0)
+        .opacity(model.yearFilterEnabled && paperCount == 0 ? 0.42 : 1)
         .animation(.spring(response: 0.35, dampingFraction: 0.8), value: isSelected)
     }
 }
@@ -746,6 +1055,14 @@ struct ClusterDetailCard: View {
     let cluster: Cluster
     let onZoom: (() -> Void)?
 
+    @State private var isEditing: Bool = false
+    @State private var draftName: String = ""
+    @State private var draftMeta: String = ""
+    @State private var isNaming: Bool = false
+    @State private var showDossier: Bool = false
+    @State private var dossierText: String = ""
+    @State private var isGeneratingDossier: Bool = false
+
     var body: some View {
         GlassPanel {
             VStack(alignment: .leading, spacing: 8) {
@@ -754,21 +1071,123 @@ struct ClusterDetailCard: View {
                         Text(cluster.name)
                             .font(.headline)
                             .foregroundStyle(.white)
-                        Text("\(cluster.memberPaperIDs.count) papers")
+                        let filteredCount = model.paperCount(for: cluster)
+                        let countLabel: String = {
+                            guard model.yearFilterEnabled else { return "\(filteredCount) papers" }
+                            return "\(filteredCount)/\(cluster.memberPaperIDs.count) papers"
+                        }()
+                        Text(countLabel)
                             .font(.caption.bold())
                             .foregroundStyle(.white.opacity(0.8))
                     }
                     Spacer()
+                    Button {
+                        if isEditing {
+                            draftName = ""
+                            draftMeta = ""
+                        } else {
+                            draftName = cluster.name
+                            draftMeta = cluster.metaSummary
+                        }
+                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                            isEditing.toggle()
+                        }
+                    } label: {
+                        Image(systemName: isEditing ? "xmark" : "pencil")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(Color.white.opacity(0.12))
+
+                    Button {
+                        guard !isNaming else { return }
+                        isNaming = true
+                        Task {
+                            await model.autoNameGalaxyCluster(clusterID: cluster.id)
+                            await MainActor.run { isNaming = false }
+                        }
+                    } label: {
+                        if isNaming {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: "sparkles")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(Color.white.opacity(0.12))
+                    .contextMenu {
+                        Button("Force AI re-name") {
+                            guard !isNaming else { return }
+                            isNaming = true
+                            Task {
+                                await model.autoNameGalaxyCluster(clusterID: cluster.id, force: true)
+                                await MainActor.run { isNaming = false }
+                            }
+                        }
+                    }
+
                     Circle()
                         .fill(MapPalette.nodeGradient(for: cluster.id))
                         .frame(width: 14, height: 14)
                         .shadow(color: .white.opacity(0.5), radius: 6)
                 }
 
-                Text(cluster.metaSummary)
-                    .font(.footnote)
-                    .foregroundStyle(.white.opacity(0.9))
-                    .lineLimit(6)
+                if isEditing {
+                    VStack(alignment: .leading, spacing: 8) {
+                        TextField("Topic name", text: $draftName)
+                            .textFieldStyle(.roundedBorder)
+                        TextEditor(text: $draftMeta)
+                            .frame(minHeight: 72, maxHeight: 120)
+                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.16)))
+
+                        HStack {
+                            Button("Save") {
+                                model.renameGalaxyCluster(clusterID: cluster.id, name: draftName, metaSummary: draftMeta.isEmpty ? nil : draftMeta)
+                                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                    isEditing = false
+                                }
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button("Cancel") {
+                                withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                    isEditing = false
+                                }
+                            }
+                            .buttonStyle(.bordered)
+
+                            Spacer()
+                        }
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                } else {
+                    Text(cluster.metaSummary)
+                        .font(.footnote)
+                        .foregroundStyle(.white.opacity(0.9))
+                        .lineLimit(6)
+                        .transition(.opacity)
+                }
+
+                HStack {
+                    Button {
+                        showDossier = true
+                        if dossierText.isEmpty {
+                            loadDossier(force: false)
+                        }
+                    } label: {
+                        Label("Dossier", systemImage: "doc.text")
+                            .font(.subheadline.bold())
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(Color.white.opacity(0.12))
+
+                    if isGeneratingDossier {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+
+                    Spacer()
+                }
 
                 if let onZoom {
                     Button {
@@ -781,11 +1200,82 @@ struct ClusterDetailCard: View {
                     .tint(Color.white.opacity(0.16))
                 }
 
-                if let example = model.papers.first(where: { $0.clusterIndex == cluster.id }) {
+                let sampleID: UUID? = {
+                    if model.yearFilterEnabled,
+                       let pid = cluster.memberPaperIDs.first(where: { model.explorationPaperIDs.contains($0) }) {
+                        return pid
+                    }
+                    return cluster.memberPaperIDs.first
+                }()
+                if let pid = sampleID,
+                   let example = model.papers.first(where: { $0.id == pid }) {
                     Text("Sample: \(example.title)")
                         .font(.caption2)
                         .foregroundStyle(.white.opacity(0.8))
                 }
+            }
+        }
+        .onChange(of: cluster.id) { _, _ in
+            dossierText = ""
+            isGeneratingDossier = false
+        }
+        .sheet(isPresented: $showDossier) {
+            NavigationStack {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text(cluster.name)
+                            .font(.title3.bold())
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        Button {
+                            loadDossier(force: true)
+                        } label: {
+                            Label("Regenerate", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(isGeneratingDossier)
+                    }
+
+                    if isGeneratingDossier {
+                        HStack {
+                            ProgressView()
+                            Text("Synthesizing…")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    ScrollView {
+                        Text(dossierText.isEmpty ? "No dossier yet — tap Regenerate or close and reopen." : dossierText)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+
+                    Spacer()
+                }
+                .padding()
+                .navigationTitle("Topic dossier")
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("Close") { showDossier = false }
+                    }
+                }
+            }
+            #if os(iOS)
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+            #endif
+            .frame(minWidth: 520, minHeight: 520)
+        }
+    }
+
+    private func loadDossier(force: Bool) {
+        guard !isGeneratingDossier else { return }
+        isGeneratingDossier = true
+        Task {
+            let text = await model.loadOrGenerateTopicDossier(clusterID: cluster.id, force: force) ?? ""
+            await MainActor.run {
+                dossierText = text
+                isGeneratingDossier = false
             }
         }
     }
@@ -796,73 +1286,326 @@ struct PaperScatterView: View {
     let papers: [Paper]
     let highlights: [UUID: PaperNoveltyScore]
     let driftVector: (dx: Double, dy: Double)?
+    var onSelectPaper: ((Paper) -> Void)?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var expandedPaperID: UUID?
+    @State private var panOffset: CGSize = .zero
+    @GestureState private var gesturePan: CGSize = .zero
+    @State private var zoomScale: CGFloat = 1.0
+    @GestureState private var gestureZoom: CGFloat = 1.0
 
     var body: some View {
         GeometryReader { geo in
             let size = geo.size
             let center = CGPoint(x: size.width / 2, y: size.height / 2)
             let radius = min(size.width, size.height) / 2 - 60
+            let usesDotMode = shouldUseDotMode(total: papers.count, size: size)
+            let scale = clampScale(zoomScale * gestureZoom)
+            let offset = CGSize(width: panOffset.width + gesturePan.width, height: panOffset.height + gesturePan.height)
+            let basePositions: [CGPoint] = papers.enumerated().map { idx, _ in
+                position(for: idx, total: papers.count, center: center, radius: radius)
+            }
+            let resolvedPositions: [CGPoint] = usesDotMode
+                ? basePositions
+                : relaxedPositions(
+                    base: basePositions,
+                    center: center,
+                    radius: radius,
+                    expandedPaperID: expandedPaperID
+                )
             ZStack {
                 RoundedRectangle(cornerRadius: 24)
                     .fill(MapPalette.canvas)
                     .overlay(MapPalette.glow)
                     .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 10)
-                if let drift = driftVector {
-                    let len = radius * 0.25
-                    let end = CGPoint(x: center.x + len * CGFloat(drift.dx), y: center.y + len * CGFloat(drift.dy))
-                    ArrowShape(start: center, end: end)
-                        .stroke(Color.cyan.opacity(0.7), style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                }
 
                 if papers.isEmpty {
                     Text("Select a subtopic to see its papers.")
                         .foregroundStyle(.white.opacity(0.7))
                 } else {
-                    ForEach(Array(papers.enumerated()), id: \.1.id) { idx, paper in
-                        let pos = position(for: idx, total: papers.count, center: center, radius: radius)
-                        let score = highlights[paper.id]
-                        PaperNodeView(paper: paper, highlight: score)
-                            .position(pos)
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) {
+                            withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) {
+                                zoomScale = 1.0
+                                panOffset = .zero
+                            }
+                        }
+                        .onTapGesture {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                expandedPaperID = nil
+                            }
+                        }
+
+                    ZStack {
+                        if let drift = driftVector {
+                            let len = radius * 0.25
+                            let end = CGPoint(x: center.x + len * CGFloat(drift.dx), y: center.y + len * CGFloat(drift.dy))
+                            ArrowShape(start: center, end: end)
+                                .stroke(Color.cyan.opacity(0.7), style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                                .opacity(usesDotMode ? 0.45 : 0.7)
+                        }
+
+                        if usesDotMode {
+                            ForEach(Array(papers.enumerated()), id: \.1.id) { idx, paper in
+                                let pos = resolvedPositions[idx]
+                                let score = highlights[paper.id]
+                                let isSelected = expandedPaperID == paper.id
+                                PaperDotView(highlight: score, isSelected: isSelected)
+                                    .position(pos)
+                                    .contentShape(Circle())
+                                    .onTapGesture {
+                                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                            expandedPaperID = isSelected ? nil : paper.id
+                                        }
+                                    }
+                            }
+
+                            if let selectedID = expandedPaperID,
+                               let idx = papers.firstIndex(where: { $0.id == selectedID }) {
+                                let paper = papers[idx]
+                                let pos = resolvedPositions[idx]
+                                PaperNodeView(
+                                    paper: paper,
+                                    highlight: highlights[paper.id],
+                                    isExpanded: true,
+                                    onOpen: { onSelectPaper?(paper) }
+                                )
+                                .position(pos)
+                                .zIndex(10)
+                                .transition(.opacity.combined(with: .scale(scale: 0.98)))
+                            }
+                        } else {
+                            ForEach(Array(papers.enumerated()), id: \.1.id) { idx, paper in
+                                let pos = resolvedPositions[idx]
+                                let score = highlights[paper.id]
+                                let isExpanded = expandedPaperID == paper.id
+                                PaperNodeView(
+                                    paper: paper,
+                                    highlight: score,
+                                    isExpanded: isExpanded,
+                                    onOpen: { onSelectPaper?(paper) }
+                                )
+                                .position(pos)
+                                .zIndex(isExpanded ? 10 : 0)
+                                .onTapGesture {
+                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+                                        expandedPaperID = isExpanded ? nil : paper.id
+                                    }
+                                }
+                                .animation(.spring(response: 0.45, dampingFraction: 0.85), value: pos)
+                            }
+                        }
                     }
+                    .scaleEffect(scale, anchor: .center)
+                    .offset(offset)
+                    .animation(reduceMotion ? nil : .spring(response: 0.45, dampingFraction: 0.85), value: scale)
                 }
             }
+            .simultaneousGesture(panAndZoomGesture())
         }
     }
 
     private func position(for index: Int, total: Int, center: CGPoint, radius: CGFloat) -> CGPoint {
-        let angle = 2 * Double.pi * Double(index) / Double(max(total, 1))
-        let radial = radius * CGFloat(0.4 + 0.6 * sqrt(Double(index + 1) / Double(max(total, 1))))
+        let goldenAngle = Double.pi * (3 - sqrt(5))
+        let i = Double(index + 1)
+        let denom = Double(max(total, 1))
+        let radial = radius * CGFloat(sqrt(i / denom))
+        let angle = i * goldenAngle
         return CGPoint(
             x: center.x + radial * CGFloat(cos(angle)),
             y: center.y + radial * CGFloat(sin(angle))
         )
     }
+
+    private func relaxedPositions(
+        base: [CGPoint],
+        center: CGPoint,
+        radius: CGFloat,
+        expandedPaperID: UUID?
+    ) -> [CGPoint] {
+        guard base.count > 1 else { return base }
+        let n = base.count
+        let cardRadius: CGFloat = 96
+        let expandedRadius: CGFloat = 210
+        let iterations = min(30, max(14, n + 6))
+
+        func nodeRadius(at index: Int) -> CGFloat {
+            guard let expandedPaperID, papers[index].id == expandedPaperID else { return cardRadius }
+            return expandedRadius
+        }
+
+        var positions = base
+        for _ in 0..<iterations {
+            for i in 0..<n {
+                for j in (i + 1)..<n {
+                    let ri = nodeRadius(at: i)
+                    let rj = nodeRadius(at: j)
+                    var dx = positions[j].x - positions[i].x
+                    var dy = positions[j].y - positions[i].y
+                    let dist = max(0.0001, sqrt(dx * dx + dy * dy))
+                    let minDist = ri + rj
+                    if dist < minDist {
+                        let overlap = (minDist - dist) * 0.5
+                        dx /= dist
+                        dy /= dist
+                        positions[i].x -= dx * overlap
+                        positions[i].y -= dy * overlap
+                        positions[j].x += dx * overlap
+                        positions[j].y += dy * overlap
+                    }
+                }
+            }
+
+            for i in 0..<n {
+                let ri = nodeRadius(at: i)
+                positions[i].x = positions[i].x * 0.92 + base[i].x * 0.08
+                positions[i].y = positions[i].y * 0.92 + base[i].y * 0.08
+
+                var dx = positions[i].x - center.x
+                var dy = positions[i].y - center.y
+                let dist = max(0.0001, sqrt(dx * dx + dy * dy))
+                let maxDist = max(0, radius - ri)
+                if dist > maxDist {
+                    dx /= dist
+                    dy /= dist
+                    positions[i].x = center.x + dx * maxDist
+                    positions[i].y = center.y + dy * maxDist
+                }
+            }
+        }
+        return positions
+    }
+
+    private func shouldUseDotMode(total: Int, size: CGSize) -> Bool {
+        guard total > 0 else { return false }
+        let area = size.width * size.height
+        let cardFootprint: CGFloat = 220 * 160
+        let capacity = Int(area / cardFootprint)
+        let threshold = max(8, min(48, capacity))
+        return total > threshold
+    }
+
+    private func panAndZoomGesture() -> some Gesture {
+        let pan = DragGesture(minimumDistance: 4)
+            .updating($gesturePan) { value, state, _ in
+                state = value.translation
+            }
+            .onEnded { value in
+                panOffset = CGSize(width: panOffset.width + value.translation.width, height: panOffset.height + value.translation.height)
+            }
+
+        let zoom = MagnificationGesture()
+            .updating($gestureZoom) { value, state, _ in
+                state = value
+            }
+            .onEnded { value in
+                zoomScale = clampScale(zoomScale * value)
+            }
+
+        return SimultaneousGesture(pan, zoom)
+    }
+
+    private func clampScale(_ value: CGFloat) -> CGFloat {
+        min(max(value, 0.65), 2.6)
+    }
+}
+
+@available(macOS 26, iOS 26, *)
+private struct PaperDotView: View {
+    let highlight: PaperNoveltyScore?
+    let isSelected: Bool
+
+    private var tint: Color {
+        guard let highlight else { return Color.white.opacity(0.55) }
+        if highlight.novelty > 0.6 { return Color.purple.opacity(0.85) }
+        if highlight.saturation > 0.6 { return Color.orange.opacity(0.85) }
+        return Color.mint.opacity(0.75)
+    }
+
+    var body: some View {
+        Circle()
+            .fill(tint)
+            .frame(width: isSelected ? 14 : 9, height: isSelected ? 14 : 9)
+            .overlay(
+                Circle()
+                    .stroke(Color.white.opacity(isSelected ? 0.55 : 0.18), lineWidth: isSelected ? 2 : 1)
+            )
+            .shadow(color: tint.opacity(isSelected ? 0.45 : 0.22), radius: isSelected ? 10 : 4, x: 0, y: 3)
+            .animation(.spring(response: 0.35, dampingFraction: 0.85), value: isSelected)
+    }
 }
 
 @available(macOS 26, iOS 26, *)
 struct PaperNodeView: View {
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.openURL) private var openURL
+
     let paper: Paper
     let highlight: PaperNoveltyScore?
+    let isExpanded: Bool
+    var onOpen: (() -> Void)?
+
+    @State private var isHovering: Bool = false
+    @State private var isShowingTagPrompt: Bool = false
+    @State private var newTag: String = ""
+    @State private var isShowingQuestion: Bool = false
+    @State private var questionText: String = ""
+    @State private var questionAnswer: String = ""
+    @State private var isAnswering: Bool = false
+
+    private var cardWidth: CGFloat { isExpanded ? 360 : 160 }
+    private var latestPaper: Paper {
+        model.papers.first(where: { $0.id == paper.id }) ?? paper
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text(paper.title)
-                .font(.subheadline.bold())
-                .foregroundStyle(.white)
-                .lineLimit(2)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                Text(paper.title)
+                    .font(.subheadline.bold())
+                    .foregroundStyle(.white)
+                    .lineLimit(isExpanded ? 3 : 2)
+                Spacer(minLength: 0)
+                Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                    .font(.caption.bold())
+                    .foregroundStyle(.white.opacity(0.7))
+                    .padding(.top, 2)
+            }
+
+            if isExpanded {
+                HStack(spacing: 10) {
+                    if let year = paper.year {
+                        Label("\(year)", systemImage: "calendar")
+                    }
+                    if let pages = paper.pageCount {
+                        Label("\(pages)p", systemImage: "doc.text")
+                    }
+                    Spacer()
+                }
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.75))
+            }
+
             Text(paper.summary)
                 .font(.caption2)
                 .foregroundStyle(.white.opacity(0.85))
-                .lineLimit(3)
-            if let status = paper.readingStatus {
-                Text(status.label)
-                    .font(.caption2)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 3)
-                    .background(Color.green.opacity(0.2), in: Capsule())
+                .lineLimit(isExpanded ? 8 : 3)
+
+            if isExpanded {
+                quickActions
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
-            if let h = highlight {
-                HStack(spacing: 6) {
+
+            HStack(spacing: 6) {
+                if let status = paper.readingStatus {
+                    Text(status.label)
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.green.opacity(0.2), in: Capsule())
+                }
+                if let h = highlight {
                     if h.novelty > 0.6 {
                         Label("Outlier", systemImage: "sparkle")
                             .font(.caption2.bold())
@@ -879,18 +1622,305 @@ struct PaperNodeView: View {
                     }
                 }
             }
+
+            if isExpanded {
+                if let takeaways = paper.takeaways, !takeaways.isEmpty {
+                    Divider().overlay(Color.white.opacity(0.12))
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Takeaways")
+                            .font(.caption.bold())
+                            .foregroundStyle(.white.opacity(0.85))
+                        ForEach(takeaways.prefix(4), id: \.self) { item in
+                            Text("• \(item)")
+                                .font(.caption2)
+                                .foregroundStyle(.white.opacity(0.85))
+                                .lineLimit(2)
+                        }
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+
+                if let keywords = paper.keywords, !keywords.isEmpty {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 70), spacing: 6)],
+                        alignment: .leading,
+                        spacing: 6
+                    ) {
+                        ForEach(keywords.prefix(8), id: \.self) { kw in
+                            Text(kw)
+                                .font(.caption2.bold())
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 4)
+                                .background(Color.white.opacity(0.08), in: Capsule())
+                                .foregroundStyle(.white.opacity(0.9))
+                        }
+                    }
+                    .transition(.opacity)
+                }
+
+                if let onOpen {
+                    Button {
+                        onOpen()
+                    } label: {
+                        Label("Open full details", systemImage: "doc.text.magnifyingglass")
+                            .font(.caption.bold())
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(Color.white.opacity(0.16))
+                    .padding(.top, 2)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
         }
         .padding(10)
-        .frame(width: 180, alignment: .leading)
+        .frame(width: cardWidth, alignment: .leading)
         .background(
-            LinearGradient(
-                colors: [Color.white.opacity(0.06), Color.white.opacity(0.02)],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
+            ZStack {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(.thinMaterial)
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(Color.black.opacity(isExpanded ? 0.28 : 0.22))
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [Color.white.opacity(0.06), Color.white.opacity(0.025)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .blendMode(.overlay)
+            }
         )
-        .clipShape(RoundedRectangle(cornerRadius: 14))
-        .shadow(color: .black.opacity(0.15), radius: 6, x: 0, y: 3)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(isExpanded ? 0.28 : 0.12), lineWidth: isExpanded ? 2 : 1)
+        )
+        .shadow(color: .black.opacity(isExpanded ? 0.28 : 0.15), radius: isExpanded ? 12 : 6, x: 0, y: isExpanded ? 8 : 3)
+        .scaleEffect(isExpanded ? 1.06 : (isHovering ? 1.02 : 1.0))
+        .onHover { hovering in
+            isHovering = hovering
+        }
+        .animation(.spring(response: 0.35, dampingFraction: 0.85), value: isExpanded)
+        .alert("Add a tag", isPresented: $isShowingTagPrompt) {
+            TextField("Tag", text: $newTag)
+            Button("Add") {
+                addTag()
+            }
+            Button("Cancel", role: .cancel) {
+                newTag = ""
+            }
+        } message: {
+            Text("Tags help you filter and prioritize papers.")
+        }
+        .sheet(isPresented: $isShowingQuestion) {
+            NavigationStack {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(latestPaper.title)
+                        .font(.headline)
+                    TextField("Ask a question about this paper…", text: $questionText, axis: .vertical)
+                        .textFieldStyle(.roundedBorder)
+
+                    HStack {
+                        Button {
+                            let trimmed = questionText.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !trimmed.isEmpty else { return }
+                            Task { await answerQuestion(trimmed) }
+                        } label: {
+                            Label(isAnswering ? "Asking…" : "Ask", systemImage: "paperplane.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isAnswering || questionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+
+                        Button("Clear") {
+                            questionText = ""
+                            questionAnswer = ""
+                        }
+                        .buttonStyle(.bordered)
+
+                        Spacer()
+                    }
+
+                    if isAnswering {
+                        HStack {
+                            ProgressView()
+                            Text("Thinking…")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+
+                    if !questionAnswer.isEmpty {
+                        Divider()
+                        ScrollView {
+                            Text(questionAnswer)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+
+                    Spacer()
+                }
+                .padding()
+                .navigationTitle("Ask about paper")
+                .toolbar {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button("Close") { isShowingQuestion = false }
+                    }
+                }
+            }
+            #if os(iOS)
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+            #endif
+            .frame(minWidth: 520, minHeight: 460)
+        }
+    }
+
+    private var quickActions: some View {
+        HStack(spacing: 8) {
+            Menu {
+                Button("Unread") { setReadingStatus(.unread) }
+                Button("In progress") { setReadingStatus(.inProgress) }
+                Button("Done") { setReadingStatus(.done) }
+                Divider()
+                Button("Clear status") { setReadingStatus(nil) }
+            } label: {
+                Label(latestPaper.readingStatus?.label ?? "Status", systemImage: "checkmark.circle")
+                    .font(.caption.bold())
+            }
+            .buttonStyle(.bordered)
+            .tint(Color.white.opacity(0.12))
+            .help("Set reading status")
+
+            Button {
+                toggleImportant()
+            } label: {
+                Image(systemName: isStarred ? "star.fill" : "star")
+            }
+            .buttonStyle(.bordered)
+            .tint(Color.white.opacity(0.12))
+            .help(isStarred ? "Unstar" : "Star")
+
+            Button {
+                newTag = ""
+                isShowingTagPrompt = true
+            } label: {
+                Image(systemName: "tag")
+            }
+            .buttonStyle(.bordered)
+            .tint(Color.white.opacity(0.12))
+            .help("Add tag")
+
+            Button {
+                questionText = ""
+                questionAnswer = ""
+                isShowingQuestion = true
+            } label: {
+                Image(systemName: "questionmark.bubble")
+            }
+            .buttonStyle(.bordered)
+            .tint(Color.white.opacity(0.12))
+            .help("Ask about this paper")
+
+            Button {
+                openURL(latestPaper.fileURL)
+            } label: {
+                Image(systemName: "doc.richtext")
+            }
+            .buttonStyle(.bordered)
+            .tint(Color.white.opacity(0.12))
+            .help("Open PDF")
+        }
+    }
+
+    private var isStarred: Bool {
+        if latestPaper.isImportant == true { return true }
+        let tags = latestPaper.userTags ?? []
+        return tags.contains(where: { tag in
+            let norm = tag.lowercased()
+            return norm == "important" || norm == "starred" || norm == "fav" || norm == "favorite"
+        })
+    }
+
+    private func setReadingStatus(_ status: ReadingStatus?) {
+        let notes = latestPaper.userNotes ?? ""
+        let tags = latestPaper.userTags ?? []
+        model.updatePaperUserData(id: paper.id, notes: notes, tags: tags, status: status)
+    }
+
+    private func toggleImportant() {
+        let notes = latestPaper.userNotes ?? ""
+        var tags = latestPaper.userTags ?? []
+        let importantKeys: Set<String> = ["important", "starred", "fav", "favorite"]
+
+        if isStarred {
+            tags = tags.filter { !importantKeys.contains($0.lowercased()) }
+        } else {
+            if !tags.contains(where: { $0.lowercased() == "important" }) {
+                tags.append("important")
+            }
+        }
+
+        model.updatePaperUserData(id: paper.id, notes: notes, tags: tags, status: latestPaper.readingStatus)
+    }
+
+    private func addTag() {
+        let tag = newTag.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !tag.isEmpty else { return }
+        let notes = latestPaper.userNotes ?? ""
+        var tags = latestPaper.userTags ?? []
+        if !tags.contains(where: { $0.lowercased() == tag.lowercased() }) {
+            tags.append(tag)
+        }
+        model.updatePaperUserData(id: paper.id, notes: notes, tags: tags, status: latestPaper.readingStatus)
+        newTag = ""
+    }
+
+    private func answerQuestion(_ question: String) async {
+        isAnswering = true
+        questionAnswer = ""
+        defer { isAnswering = false }
+
+        let takeaways = latestPaper.takeaways?.prefix(6).joined(separator: "\n• ") ?? ""
+        let keywords = latestPaper.keywords?.prefix(12).joined(separator: ", ") ?? ""
+        let fallbackInstructions = "You answer questions about a single research paper using only provided context."
+        let instructions = PromptStore.loadText("ui.single_paper_qa.instructions.md", fallback: fallbackInstructions)
+
+        let fallbackTemplate = """
+        Answer the question using ONLY the information in the paper context. If the context doesn't contain the answer, say what is missing.
+
+        Paper title:
+        {{title}}
+
+        Keywords:
+        {{keywords}}
+
+        Summary:
+        {{summary}}
+
+        Takeaways:
+        {{takeaways}}
+
+        Question:
+        {{question}}
+
+        Write a concise answer in 5-10 bullet points.
+        """
+        let template = PromptStore.loadText("ui.single_paper_qa.prompt.md", fallback: fallbackTemplate)
+        let prompt = PromptStore.render(template: template, variables: [
+            "title": latestPaper.title,
+            "keywords": keywords,
+            "summary": latestPaper.summary,
+            "takeaways": takeaways.isEmpty ? "(none provided)" : "• \(takeaways)",
+            "question": question
+        ])
+
+        do {
+            let session = LanguageModelSession(instructions: instructions)
+            let response = try await session.respond(to: prompt)
+            questionAnswer = response.content
+        } catch {
+            questionAnswer = "Failed to answer: \(error.localizedDescription)"
+        }
     }
 }
 
@@ -904,8 +1934,16 @@ private struct GlassPanel<Content: View>: View {
     var body: some View {
         content()
             .padding(14)
-            .background(MapPalette.panel)
-            .background(.ultraThinMaterial.opacity(0.4))
+            .background(
+                ZStack {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(.thinMaterial)
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color.black.opacity(0.22))
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(MapPalette.panel)
+                }
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: 18)
                     .stroke(MapPalette.panelStroke, lineWidth: 1)

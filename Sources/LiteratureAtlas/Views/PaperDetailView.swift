@@ -5,7 +5,9 @@ import FoundationModels
 @available(macOS 26, iOS 26, *)
 struct PaperDetailView: View {
     @EnvironmentObject private var model: AppModel
+    @Environment(\.dismiss) private var dismiss
     let paper: Paper
+    var onClose: (() -> Void)? = nil
 
     @State private var explainLevel: ExplainLevel = .expert
     @State private var generatedELI: String = ""
@@ -288,6 +290,24 @@ struct PaperDetailView: View {
             }
             .padding()
         }
+        .safeAreaInset(edge: .bottom) {
+            HStack {
+                Spacer()
+                Button {
+                    if let onClose {
+                        onClose()
+                    } else {
+                        dismiss()
+                    }
+                } label: {
+                    Label("Close", systemImage: "xmark")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 12)
+            .background(.ultraThinMaterial)
+        }
         .navigationTitle(paper.title)
         .onAppear {
             notesText = paper.userNotes ?? ""
@@ -383,15 +403,23 @@ struct PaperDetailView: View {
     private func generateELI() async {
         generatedELI = "Generating..."
         let levelText = explainLevel.prompt
-        let prompt = """
-        Explain this paper to a \(levelText) reader using the summary below.
+        let fallbackInstructions = "You simplify research papers for different audiences."
+        let instructions = PromptStore.loadText("ui.eli.instructions.md", fallback: fallbackInstructions)
+
+        let fallbackTemplate = """
+        Explain this paper to a {{level}} reader using the summary below.
         Keep it concise (5-7 sentences).
 
         Summary:
-        \(paper.summary)
+        {{summary}}
         """
+        let template = PromptStore.loadText("ui.eli.prompt.md", fallback: fallbackTemplate)
+        let prompt = PromptStore.render(template: template, variables: [
+            "level": levelText,
+            "summary": paper.summary
+        ])
         do {
-            let session = LanguageModelSession(instructions: "You simplify research papers for different audiences.")
+            let session = LanguageModelSession(instructions: instructions)
             let response = try await session.respond(to: prompt)
             generatedELI = response.content
         } catch {

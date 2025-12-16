@@ -138,7 +138,7 @@ struct IngestView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Step 1 - Ingest PDFs")
                             .font(.title.bold())
-                        Text("Summarize first pages on-device, embed with NLContextualEmbedding, and write JSON files into the repo Output folder (no data leaves the app).")
+                        Text("Summarize first pages on-device, embed with NLContextualEmbedding, and write JSON + Obsidian-ready Markdown notes into the repo Output folder (no data leaves the app).")
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }

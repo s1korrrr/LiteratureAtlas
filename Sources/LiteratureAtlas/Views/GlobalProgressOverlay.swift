@@ -37,6 +37,7 @@ struct GlobalProgressOverlay: View {
         }
         .padding(.horizontal, 16)
         .ignoresSafeArea(edges: .bottom)
+        .allowsHitTesting(model.isIngesting || model.isClustering)
     }
 
     private var progressValue: Double {

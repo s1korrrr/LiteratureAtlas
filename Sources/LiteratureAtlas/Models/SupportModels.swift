@@ -52,6 +52,25 @@ struct ClusterSummary {
     let metaSummary: String
 }
 
+struct ClusterInsights: Equatable {
+    let topKeywords: [String]
+    let topTitles: [String]
+}
+
+enum ClusterNameSource: String, Codable, CaseIterable, Equatable {
+    case heuristic
+    case manual
+    case ai
+
+    var label: String {
+        switch self {
+        case .heuristic: return "Heuristic"
+        case .manual: return "Manual"
+        case .ai: return "AI"
+        }
+    }
+}
+
 // Personalized planning
 enum CurriculumStage: String, Codable, CaseIterable, Equatable {
     case foundation
@@ -80,4 +99,3 @@ struct KnowledgeSnapshot: Equatable {
     let missing: [Paper]
     let summary: String
 }
-

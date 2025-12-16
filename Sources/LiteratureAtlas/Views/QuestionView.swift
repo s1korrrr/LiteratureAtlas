@@ -18,6 +18,24 @@ struct QuestionView: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                 } else {
+                    if model.yearFilterEnabled, let range = model.effectiveYearRange {
+                        HStack {
+                            Label("Years \(range.lowerBound)–\(range.upperBound)", systemImage: "calendar")
+                                .font(.caption.bold())
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                            Button("Clear") { model.resetYearFilter() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                        }
+                    }
+
+                    if model.yearFilterEnabled, model.explorationPapers.isEmpty {
+                        Text("No papers in the selected year range. Clear the filter to search the full corpus.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
                     HStack(alignment: .top) {
                         TextField("Ask a question about your corpus...", text: $localQuestion, axis: .vertical)
                             .textFieldStyle(.roundedBorder)

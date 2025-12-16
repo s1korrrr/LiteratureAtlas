@@ -16,7 +16,7 @@
     - `PDFProcessor.swift` (PDF text/metadata extraction), `EmbeddingService.swift` (sentence embeddings + KMeans), `VectorIndex.swift` (in-process similarity search fallback), `LLMActors.swift` (summaries, cluster naming, Q&A), `ClaimGraph.swift` (claim extraction/relations/stress tests), `TemporalAnalytics.swift` (novelty, drift, panel/debate simulators), `AnalyticsStore.swift` (loads Python-generated `analytics.json`), `AtlasFFI.swift` (HNSW/graph FFI loader).
   - `Views/`: `IngestView`, `MapView`, `QuestionView`, `AnalyticsView`, `PaperDetailView`, `GlobalProgressOverlay`, etc.
 - **Analytics backend (`analytics/`)**
-  - `rebuild_analytics.py`: loads app outputs, writes `Output/atlas.duckdb`, Parquet snapshots, and `Output/analytics/analytics.json` (baseline metrics plus quality/stability/lifecycle/bridges/citations/claims/methods/workflow/hygiene sections).
+  - `rebuild_analytics.py`: loads app outputs, writes `Output/atlas.duckdb`, Parquet snapshots, and `Output/analytics/analytics.json` (novelty, centrality, drift, factor loadings, recommendations, counterfactuals, user event stats).
   - `requirements.txt` / `pyproject.toml`: Python dependencies.
   - `rust/`: CLI that builds ANN edges from Parquet embeddings using Polars (see `analytics/rust/src/main.rs`).
   - `ffi/`: Rust `cdylib/staticlib` exposing HNSW search and basic graph analytics to Swift (`analytics/ffi/src/lib.rs`, headers in `analytics/ffi/include/`).
@@ -30,7 +30,7 @@
 - Reading planner: recommendations, blind spots, adaptive curriculum, flashcards, daily quiz, and knowledge snapshots — `AppModel.recommendedNextPapers`, `adaptiveCurriculum`, `dailyQuizCards`.
 - Corpus-level synthesis: generate an executive “corpus briefing” from the current topic hierarchy (cached to `Output/reports/`) — `AppModel.generateCorpusBriefing`, `LLMActors.CorpusBriefingActor`.
 - Topic dossiers: generate a structured briefing for any selected cluster (cached to `Output/reports/`) — `AppModel.loadOrGenerateTopicDossier`, `LLMActors.TopicDossierActor`.
-- Analytics dashboard fed by Python outputs: topic trends, novelty/consensus, drift, factors, influence + newer trust/stability/lifecycle/bridge/citation/workflow signals — `AnalyticsView`, `analytics/rebuild_analytics.py`.
+- Analytics dashboard fed by Python outputs: topic trends, novelty vs. centrality scatter, drift vectors, factor exposures, influence, counterfactual scenarios, and uncertainty proxy — `AnalyticsView`, `analytics/rebuild_analytics.py`.
 - Optional Rust acceleration: HNSW ANN + graph metrics via `analytics/ffi` (linked into the Swift target) and a standalone Polars-based ANN graph builder in `analytics/rust`.
 - Event logging to `Output/analytics/user_events.jsonl` for later aggregation (questions asked, answers ready, papers opened).
 
@@ -57,8 +57,6 @@
 - **Configuration**
   - Data is written to `Output/` beside the repo; folders (`papers`, `chunks`, `clusters`, `analytics`, `reports`, `obsidian/papers`) are created automatically.
   - Prompt templates live in `Prompts/` (override path via `LITERATURE_ATLAS_PROMPTS_DIR`); edit them to iterate on prompts without touching Swift code.
-  - On macOS, the Analytics screen can install Python deps and run the rebuild; it prefers a repo-local `.venv` when present.
-  - Override the Python interpreter used by the app via `LITERATURE_ATLAS_PYTHON` (e.g. `.venv/bin/python3`).
   - Analytics script flags: `--base /path/to/repo`, `--db <path>`, `--counterfactual-cutoffs 2010 2015 2020` (see `analytics/rebuild_analytics.py`).
   - The Swift target links against `analytics/ffi/target/release`; ensure the library exists before running `swift run`/`swift build`.
   - Optional user events: the app appends newline-delimited JSON to `Output/analytics/user_events.jsonl`.
@@ -96,9 +94,7 @@
   swift test
   ```
   - Covers ingestion upsert logic, clustering assignments, PDF year inference, claim extraction/relations/stress tests, vector index, galaxy math, analytics store, and temporal analytics (`Tests/LiteratureAtlasTests/*`).
-- Python analytics checks:
-  - End-to-end rebuild: `python analytics/rebuild_analytics.py`
-  - Unit tests: `python -m unittest discover -s analytics/tests`
+- No dedicated Python test suite; run `python analytics/rebuild_analytics.py` to validate the pipeline end-to-end.
 - Rust crates have minimal logic and can be checked with `cargo test` (none defined) or `cargo fmt --check` if desired.
 
 ## 8. Module-Level Documentation (Compact)
@@ -118,7 +114,7 @@
 - `Output/chunks/chunks.json` — chunk-level text + embeddings for RAG.
 - `Output/clusters/*.json` — cached cluster layouts/snapshots.
 - `Output/atlas.duckdb` — DuckDB database built by analytics script; Parquet snapshots in `Output/analytics/*.parquet`.
-- `Output/analytics/analytics.json` — compact analytics payload the app reloads (baseline metrics plus quality/stability/lifecycle/bridges/citations/claims/methods/workflow/hygiene sections).
+- `Output/analytics/analytics.json` — compact analytics payload the app reloads (topic_trends, novelty, centrality, drift, factors, recommendations, counterfactuals, user_events stats).
 - `Output/analytics/user_events.jsonl` — optional event log appended by the app (qa_question, qa_ready, paper_opened, rec_feedback).
 - `Output/reports/corpus_briefing_<version>.md` — cached corpus-level executive briefing generated on-device from the current topic hierarchy.
 - `Output/reports/topic_<clusterID>_dossier_<version>.md` — cached per-topic dossier generated on-device from a cluster + representative papers.
@@ -142,3 +138,223 @@
 
 ## 14. License
 - MIT License (see `LICENSE`).
+
+
+# Prompts:
+
+// File: cluster_summarizer.instructions.md
+You group research papers into thematic clusters and create short, descriptive names and meta-summaries for each cluster.
+
+
+// File: cluster_summarizer.prompt.md
+You are given short paper records for one thematic cluster. Each record may include a title, keywords, a short summary, and a few takeaways.
+
+TASK 1: Invent a short cluster name (3-6 words).
+TASK 2: Write one paragraph meta-summary (4-6 sentences).
+
+Respond EXACTLY in this format:
+
+Cluster name: <name>
+Meta-summary: <paragraph>
+
+Summaries:
+{{summaries}}
+
+
+// File: corpus_briefing.instructions.md
+You are a principal research librarian. You read a topic hierarchy and condensed metadata about a large research corpus and produce an executive briefing that helps a researcher quickly understand the landscape.
+Output must be structured Markdown with short, information-dense sections.
+
+
+// File: corpus_briefing.prompt.md
+You are given a topic hierarchy (mega-topics and subtopics) with sample paper titles and keyword themes.
+The goal is to summarize the corpus at a high level for a technically savvy reader.
+
+Write a Markdown briefing with these sections (use these exact headings):
+
+# Executive Summary
+# Theme Map
+# Methods & Data
+# Key Debates / Tensions
+# Frontiers & Open Questions
+# Suggested Reading Path
+
+Rules:
+- Be concise but specific; prefer concrete phrases over vague claims.
+- Use the provided topic names, keywords, and sample titles.
+- If something is not supported by the context, say "Not enough evidence in the provided metadata."
+- Keep the whole response under ~900 words.
+
+Context:
+{{context}}
+
+
+// File: paper_summarizer.chunk.prompt.md
+Title: {{title}}
+Chunk {{chunk_index}} of {{total_chunks}}:
+{{snippet}}
+
+Write exactly 2 concise bullet points: (1) problem, (2) method / key finding.
+Keep under 45 words total.
+
+
+// File: paper_summarizer.consolidate.prompt.md
+Title: {{title}}
+Merge the following chunk bullets into a single 3-6 bullet technical summary covering:
+- core problem
+- main method/approach
+- key results or contributions (if present)
+Keep total under 110 words.
+
+Chunk bullets:
+{{chunk_bullets}}
+
+
+// File: paper_summarizer.instructions.md
+You are an expert research assistant. Given partial text from an academic paper, write a concise technical summary in 3-6 bullet points. Focus on: the problem, main method, and key results.
+Keep it tight; avoid long quotes.
+
+
+// File: paper_summarizer.section.prompt.md
+Title: {{title}}
+Section: {{section_name}}
+
+Text:
+{{text}}
+
+Write 2-3 bullet points focusing on what this section covers.
+
+
+// File: paper_summarizer.section_instructions.md
+Summarize the given section of an academic paper in 2-3 bullet points for a technical reader. Focus on the section's purpose and key ideas.
+
+
+// File: paper_summarizer.takeaways.prompt.md
+Title: {{title}}
+
+Summary or text:
+{{text}}
+
+List 3-5 crisp bullet takeaways highlighting the core idea, method, and result. Keep each under 18 words.
+
+
+// File: question_answerer.evidence.prompt.md
+You are a cautious research assistant. Using ONLY the evidence snippets, answer the user's question.
+
+Question: {{question}}
+
+Evidence:
+{{evidence_context}}
+
+Write 3-5 concise paragraphs. Cite papers by title when appropriate. If the evidence is insufficient, say so explicitly.
+
+
+// File: question_answerer.instructions.md
+You are a helpful research assistant. You write short literature survey-style answers using the provided paper summaries, aimed at a technically savvy reader.
+
+
+// File: question_answerer.top_papers.prompt.md
+Use the following papers to answer the research question.
+
+Question:
+{{question}}
+
+Papers:
+{{papers_context}}
+
+Write a concise survey-style answer in 3-6 paragraphs. Group similar approaches, mention specific papers by title, and explain the main ideas. If something is unclear from the summaries, be honest about the uncertainty.
+
+
+// File: topic_dossier.instructions.md
+You are a senior research assistant. You write compact, structured topic dossiers that help a reader understand a research topic, its subareas, and representative papers.
+Output must be structured Markdown and should stay concrete (use the provided titles/keywords).
+
+
+// File: ui.debate.instructions.md
+You simulate debate transcripts between research ideas; you stay grounded in provided summaries.
+
+
+// File: ui.debate.prompt.md
+Simulate a structured debate between two research ideas using ONLY the provided context.
+
+Side A: {{left_title}}
+Summary A: {{left_summary}}
+Exemplars A:
+{{left_snippets}}
+
+Side B: {{right_title}}
+Summary B: {{right_summary}}
+Exemplars B:
+{{right_snippets}}
+
+Output format:
+- Start with: Rounds: {{rounds}} (steps: {{steps}})
+- Then produce {{rounds}} rounds. Each round has:
+  - A: 2-3 sentences
+  - B: 2-3 sentences
+- End with bullet lists for: Agreements, Disagreements, Next experiments.
+
+Keep it grounded: do not invent citations or facts not implied by the summaries.
+
+
+// File: ui.eli.instructions.md
+You simplify research papers for different audiences.
+
+
+// File: ui.eli.prompt.md
+Explain this paper to a {{level}} reader using the summary below.
+Keep it concise (5-7 sentences).
+
+Summary:
+{{summary}}
+
+
+// File: ui.flashcards.instructions.md
+You write compact study flashcards.
+
+
+// File: ui.flashcards.prompt.md
+Create 4 short flashcards (Q/A) to study the paper "{{title}}".
+Base them on the summary and takeaways below. Keep answers <=30 words.
+
+Summary:
+{{summary}}
+
+Takeaways:
+{{takeaways}}
+
+
+// File: ui.single_paper_qa.instructions.md
+You answer questions about a single research paper using only provided context.
+
+
+// File: ui.single_paper_qa.prompt.md
+Answer the question using ONLY the information in the paper context. If the context doesn't contain the answer, say what is missing.
+
+Paper title:
+{{title}}
+
+Keywords:
+{{keywords}}
+
+Summary:
+{{summary}}
+
+Takeaways:
+{{takeaways}}
+
+Question:
+{{question}}
+
+Write a concise answer in 5-10 bullet points.
+
+
+// File: ui.study_questions.instructions.md
+You create comprehension questions for research papers.
+
+
+// File: ui.study_questions.prompt.md
+Draft 5 questions to check understanding of the paper "{{title}}".
+Use the summary and takeaways. Mix conceptual and application questions.
+
+

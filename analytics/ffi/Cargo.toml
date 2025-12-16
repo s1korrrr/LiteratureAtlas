@@ -8,5 +8,3 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 hnsw_rs = "0.3.3"
-petgraph = "0.6"
-rand = "0.8"
