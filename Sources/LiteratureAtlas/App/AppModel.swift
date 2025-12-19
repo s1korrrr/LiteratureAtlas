@@ -36,6 +36,7 @@ final class AppModel: ObservableObject {
             recomputeCorpusYearDomain()
         }
     }
+    @Published var strategyProjects: [StrategyProject] = []
     @Published var megaClusters: [Cluster] = []
     @Published var clusters: [Cluster] = []
     @Published var paperChunks: [PaperChunk] = []
@@ -61,6 +62,13 @@ final class AppModel: ObservableObject {
     @Published var ingestionCurrentFile: String = ""
     @Published var ingestionCompletedCount: Int = 0
     @Published var ingestionTotalCount: Int = 0
+
+    @Published var tradingLensBackfillInFlight: Bool = false
+    @Published var tradingLensBackfillProgress: Double = 0
+    @Published var tradingLensBackfillCurrentPaper: String = ""
+    @Published var tradingLensBackfillCompletedCount: Int = 0
+    @Published var tradingLensBackfillTotalCount: Int = 0
+    @Published var tradingLensFailures: [UUID: String] = [:]
 
     // Data roots (all confined to repo Output to avoid writing outside the app directory)
     private let outputRoot: URL
@@ -95,6 +103,7 @@ final class AppModel: ObservableObject {
     // Services
     private let pdfProcessor = PDFProcessor()
     private let summarizer = PaperSummarizerActor()
+    private let tradingLensActor = PaperTradingLensActor()
     private let clusterSummarizer = ClusterSummarizerActor()
     private let questionAnswerer = QuestionAnswerActor()
     private let corpusBriefingActor = CorpusBriefingActor()
@@ -102,6 +111,7 @@ final class AppModel: ObservableObject {
     private let embedder = SentenceEmbedder(language: .english)
     private let logger = Logger(subsystem: "LiteratureAtlas", category: "AppModel")
     private var ingestionTask: Task<Void, Never>?
+    private var tradingLensBackfillTask: Task<Void, Never>?
     private var canonicalEmbeddingDim: Int?
     private var clusterCache: [ClusterCacheKey: [Cluster]] = [:]
     private var subclusterCache: [Int: [Cluster]] = [:]
@@ -127,11 +137,13 @@ final class AppModel: ObservableObject {
         if !skipInitialLoad {
             Task {
                 await loadSavedPapersIfNeeded()
+                await loadSavedStrategyProjectsIfNeeded()
                 await loadSavedChunksIfNeeded()
                 await loadSavedClustersIfNeeded()
                 await loadSavedGalaxyIfPresent()
                 await loadSavedCorpusBriefingIfPresent()
                 await loadAnalyticsSummaryIfPresent()
+                exportObsidianVaultArtifacts(force: false)
             }
         }
     }
@@ -151,7 +163,7 @@ final class AppModel: ObservableObject {
         } catch {
             logger.error("Failed to create Output root at \(root.path, privacy: .public): \(error.localizedDescription, privacy: .public)")
         }
-        for folder in ["papers", "qa", "clusters", "chunks", "analytics", "reports", "obsidian/papers"] {
+        for folder in ["papers", "qa", "clusters", "chunks", "analytics", "reports", "strategies", "obsidian/papers", "obsidian/strategies", "obsidian/clusters", "obsidian/.obsidian/snippets"] {
             let url = root.appendingPathComponent(folder, isDirectory: true)
             do {
                 try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
@@ -237,6 +249,13 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func explorationPapers(in cluster: Cluster) -> [Paper] {
+        guard !explorationPapers.isEmpty else { return [] }
+        guard !cluster.memberPaperIDs.isEmpty else { return [] }
+        let allowedIDs = Set(cluster.memberPaperIDs)
+        return explorationPapers.filter { allowedIDs.contains($0.id) }
+    }
+
     private func recomputeCorpusYearDomain() {
         let currentYear = Calendar.current.component(.year, from: Date())
         let years = papers.compactMap(\.year).filter { $0 >= 1900 && $0 <= currentYear + 1 }
@@ -300,8 +319,8 @@ final class AppModel: ObservableObject {
         ingestionTotalCount = 0
 
         await loadSavedPapersIfNeeded()
+        await loadSavedStrategyProjectsIfNeeded()
         await loadSavedChunksIfNeeded()
-        var knownPaths = Set(papers.map { $0.filePath })
 
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else {
@@ -332,8 +351,8 @@ final class AppModel: ObservableObject {
 
             if Task.isCancelled { break }
 
-            let baseName = pdfURL.deletingPathExtension().lastPathComponent
-            if shouldSkipPDF(pdfURL: pdfURL, baseName: baseName, knownPaths: knownPaths) {
+            let existingPaper = papers.first(where: { $0.filePath == pdfURL.path })
+            if shouldSkipPDF(pdfURL: pdfURL, existingPaper: existingPaper) {
                 ingestionLog += "\n  Skipped: up to date."
                 ingestionProgress = Double(index + 1) / Double(max(pdfs.count, 1))
                 ingestionCompletedCount = index + 1
@@ -364,8 +383,20 @@ final class AppModel: ObservableObject {
                 let methodSummary = try? await summarizer.summarizeSection(title: title, sectionName: "Methods", text: methodText)
                 let resultsSummary = try? await summarizer.summarizeSection(title: title, sectionName: "Results", text: resultsText)
                 let takeaways = try? await summarizer.generateTakeaways(title: title, text: summary)
+                let keywords = extractKeywords(title: title, summary: summary)
+
+                // Preserve existing trading lens if regeneration fails.
+                var tradingLens: PaperTradingLens? = existingPaper?.tradingLens
+                var tradingScores: TradingLensScores? = existingPaper?.tradingScores ?? existingPaper?.tradingLens?.scores
+                do {
+                    tradingLens = try await tradingLensActor.scorecard(title: title, keywords: keywords, summary: summary, takeaways: takeaways)
+                    tradingScores = tradingLens?.scores
+                    ingestionLog += "\n  Trading lens generated."
+                } catch {
+                    ingestionLog += "\n  Trading lens failed: \(error.localizedDescription)"
+                }
                 // Heuristic claim/assumption extraction for later evidence graph.
-                let preliminaryPaperID = UUID()
+                let preliminaryPaperID = existingPaper?.id ?? UUID()
                 let claimExtraction = ClaimExtractor.heuristicExtraction(summary: summary, paperID: preliminaryPaperID, year: year)
                 // Derive a lightweight method pipeline from the method summary if available.
                 let pipelineSource = methodSummary ?? summary
@@ -409,21 +440,26 @@ final class AppModel: ObservableObject {
                         methodSummary: methodSummary,
                         resultsSummary: resultsSummary,
                         takeaways: takeaways,
-                        keywords: extractKeywords(title: title, summary: summary),
-                        userNotes: nil,
-                        userTags: nil,
-                        readingStatus: nil,
-                        noteEmbedding: nil,
-                        userQuestions: nil,
-                        flashcards: nil,
+                        keywords: keywords,
+                        tradingLens: tradingLens,
+                        tradingScores: tradingScores ?? tradingLens?.scores,
+                        strategyBlueprint: existingPaper?.strategyBlueprint,
+                        backtestAudit: existingPaper?.backtestAudit,
+                        userNotes: existingPaper?.userNotes,
+                        userTags: existingPaper?.userTags,
+                        isImportant: existingPaper?.isImportant,
+                        readingStatus: existingPaper?.readingStatus,
+                        noteEmbedding: existingPaper?.noteEmbedding,
+                        userQuestions: existingPaper?.userQuestions,
+                        flashcards: existingPaper?.flashcards,
                         year: year,
                         embedding: embedding,
-                        clusterIndex: nil,
+                        clusterIndex: existingPaper?.clusterIndex,
                         claims: claimExtraction.claims,
                         assumptions: claimExtraction.assumptions,
                         evaluationContext: claimExtraction.evaluation,
                         methodPipeline: pipeline,
-                        firstReadAt: nil,
+                        firstReadAt: existingPaper?.firstReadAt,
                         ingestedAt: Date(),
                         pageCount: pageCount
                     )
@@ -439,11 +475,10 @@ final class AppModel: ObservableObject {
 
                     let jsonURL = try savePaperJSON(paper)
                     ingestionLog += "\n  Saved JSON: \(jsonURL.lastPathComponent)"
-                    if let mdURL = try? PaperMarkdownExporter.write(paper: paper, outputRoot: outputRoot) {
+                    if let mdURL = try? PaperMarkdownExporter.write(paper: paper, outputRoot: outputRoot, context: paperObsidianContextSnapshot()) {
                         ingestionLog += "\n  Saved MD: \(mdURL.lastPathComponent)"
                     }
                     saveChunkIndex()
-                    knownPaths.insert(pdfURL.path)
                 }
             } catch {
                 ingestionLog += "\n  Error: \(error.localizedDescription)"
@@ -484,38 +519,18 @@ final class AppModel: ObservableObject {
         return url
     }
 
-    private func shouldSkipPDF(pdfURL: URL, baseName: String, knownPaths: Set<String>) -> Bool {
+    private func shouldSkipPDF(pdfURL: URL, existingPaper: Paper?) -> Bool {
         let fm = FileManager.default
-        guard knownPaths.contains(pdfURL.path) else { return false }
+        guard let existingPaper else { return false }
         guard let attr = try? fm.attributesOfItem(atPath: pdfURL.path),
               let modDate = attr[.modificationDate] as? Date else { return false }
-
-        for root in dataRoots {
-            let jsonURL = root.appendingPathComponent("papers", isDirectory: true).appendingPathComponent(baseName + ".paper.json")
-            if fm.fileExists(atPath: jsonURL.path),
-               let jAttr = try? fm.attributesOfItem(atPath: jsonURL.path),
-               let jDate = jAttr[.modificationDate] as? Date,
-               jDate >= modDate,
-               validatedCachedPaper(baseName: baseName) != nil {
-                ingestionLog += "\n  Validated existing record; skipping."
-                return true
-            }
+        guard let ingestedAt = existingPaper.ingestedAt else { return false }
+        guard !existingPaper.summary.isEmpty, !existingPaper.embedding.isEmpty else { return false }
+        if ingestedAt >= modDate {
+            ingestionLog += "\n  Validated existing record; skipping."
+            return true
         }
         return false
-    }
-
-    private func validatedCachedPaper(baseName: String) -> Paper? {
-        let decoder = JSONDecoder()
-        for root in dataRoots {
-            let jsonURL = root.appendingPathComponent("papers", isDirectory: true).appendingPathComponent(baseName + ".paper.json")
-            if let data = try? Data(contentsOf: jsonURL),
-               let paper = try? decoder.decode(Paper.self, from: data) {
-                if !paper.summary.isEmpty, !paper.embedding.isEmpty {
-                    return paper
-                }
-            }
-        }
-        return nil
     }
 
     private func buildChunks(for text: String, paperID: UUID) async -> [PaperChunk] {
@@ -588,14 +603,42 @@ final class AppModel: ObservableObject {
 
     private func loadSavedPapersIfNeeded() async {
         let decoder = JSONDecoder()
-        var newestByPath: [String: (paper: Paper, date: Date?)] = [:]
+        var newestByPath: [String: (paper: Paper, date: Date?, url: URL, needsRewrite: Bool)] = [:]
 
         let candidates = listPaperJSONCandidates()
         guard !candidates.isEmpty else { return }
 
+        func normalizeTakeaways(_ takeaways: [String]?) -> (takeaways: [String]?, changed: Bool) {
+            guard let takeaways else { return (nil, false) }
+            let original: [String]? = takeaways
+            let cleanedAll = takeaways.map { raw -> String in
+                var t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+                if t.contains("**:"), !t.hasPrefix("**") {
+                    // Legacy takeaways parsing bug stripped the leading "**" from markdown bold labels like "**Problem**:".
+                    t = "**" + t
+                }
+                return t
+            }.filter { !$0.isEmpty }
+
+            func isPlaceholder(_ text: String) -> Bool {
+                let lower = text.lowercased()
+                return lower.contains("not specified") || lower.contains("unknown")
+            }
+
+            let filtered = cleanedAll.filter { !isPlaceholder($0) }
+            let chosen = filtered.isEmpty ? cleanedAll : filtered
+            let capped = Array(chosen.prefix(5))
+            let result: [String]? = capped.isEmpty ? nil : capped
+            return (result, result != original)
+        }
+
         for url in candidates {
             guard let data = try? Data(contentsOf: url),
                   var paper = try? decoder.decode(Paper.self, from: data) else { continue }
+
+            let normalized = normalizeTakeaways(paper.takeaways)
+            paper.takeaways = normalized.takeaways
+
             paper.embedding = normalizeEmbedding(paper.embedding)
             paper.noteEmbedding = normalizeEmbedding(paper.noteEmbedding ?? [])
             if let year = paper.year {
@@ -611,7 +654,7 @@ final class AppModel: ObservableObject {
                 // Prefer the most recently modified JSON if duplicates exist.
                 if let modDate = modDate, let existingDate = existing.date, modDate < existingDate { continue }
             }
-            newestByPath[paper.filePath] = (paper, modDate)
+            newestByPath[paper.filePath] = (paper, modDate, url, normalized.changed)
         }
 
         let loaded = newestByPath.values.map { $0.paper }
@@ -620,19 +663,44 @@ final class AppModel: ObservableObject {
             ingestionLog += "\nLoaded \(loaded.count) papers from disk (Output folder)."
             savePaperIndex()
 
-            // One-time Obsidian export for existing papers (only if missing).
+            let rewrites = newestByPath.values.filter { $0.needsRewrite }.map { ($0.paper, $0.url) }
+            if !rewrites.isEmpty {
+                Task.detached(priority: .utility) {
+                    let encoder = JSONEncoder()
+                    encoder.outputFormatting = [.prettyPrinted]
+                    for (paper, url) in rewrites {
+                        guard let data = try? encoder.encode(paper) else { continue }
+                        try? data.write(to: url, options: .atomic)
+                    }
+                }
+            }
+
+            // One-time Obsidian export for existing papers (create missing + upgrade old format).
             let root = outputRoot
+            let ctx = PaperMarkdownExporter.Context(allPapers: loaded)
             Task.detached(priority: .utility) {
                 let fm = FileManager.default
                 let folder = root
                     .appendingPathComponent("obsidian", isDirectory: true)
                     .appendingPathComponent("papers", isDirectory: true)
-                let existing = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
-                let existingNames = existing.map(\.lastPathComponent)
+
+                let existing = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
+
+                func existingFile(for token: String) -> URL? {
+                    existing.first(where: { $0.lastPathComponent.contains(token) })
+                }
+
+                func needsUpgrade(_ url: URL) -> Bool {
+                    guard let text = try? String(contentsOf: url, encoding: .utf8) else { return true }
+                    return !text.contains("obsidian_format_version: \(PaperMarkdownExporter.obsidianFormatVersion)")
+                }
+
                 for paper in loaded {
                     let token = paper.id.uuidString
-                    guard !existingNames.contains(where: { $0.contains(token) }) else { continue }
-                    _ = try? PaperMarkdownExporter.write(paper: paper, outputRoot: root)
+                    if let url = existingFile(for: token) {
+                        if !needsUpgrade(url) { continue }
+                    }
+                    _ = try? PaperMarkdownExporter.write(paper: paper, outputRoot: root, context: ctx)
                 }
             }
         }
@@ -652,6 +720,334 @@ final class AppModel: ObservableObject {
         }
 
         return Array(urls)
+    }
+
+    // MARK: - Strategy projects (Paper → Idea → Feature → Model → Trade → PnL → Feedback)
+
+    private func upsertStrategyProject(_ project: StrategyProject) {
+        if let idx = strategyProjects.firstIndex(where: { $0.id == project.id }) {
+            strategyProjects[idx] = project
+        } else {
+            strategyProjects.append(project)
+        }
+    }
+
+    private func listStrategyJSONCandidates() -> [URL] {
+        var urls: Set<URL> = []
+        let fm = FileManager.default
+
+        for root in dataRoots {
+            let folder = root.appendingPathComponent("strategies", isDirectory: true)
+            if let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles]) {
+                for file in files where file.lastPathComponent.hasSuffix(".strategy.json") {
+                    urls.insert(file)
+                }
+            }
+        }
+
+        return Array(urls)
+    }
+
+    private func loadSavedStrategyProjectsIfNeeded() async {
+        let decoder = JSONDecoder()
+        var newestByID: [UUID: (project: StrategyProject, date: Date?)] = [:]
+
+        let candidates = listStrategyJSONCandidates()
+        guard !candidates.isEmpty else { return }
+
+        for url in candidates {
+            guard let data = try? Data(contentsOf: url),
+                  let project = try? decoder.decode(StrategyProject.self, from: data) else { continue }
+
+            let modDate = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+            if let existing = newestByID[project.id] {
+                if let modDate, let existingDate = existing.date, modDate < existingDate { continue }
+            }
+            newestByID[project.id] = (project, modDate)
+        }
+
+        let loaded = newestByID.values.map { $0.project }.sorted { lhs, rhs in
+            lhs.updatedAt > rhs.updatedAt
+        }
+
+        if !loaded.isEmpty {
+            strategyProjects = loaded
+            ingestionLog += "\nLoaded \(loaded.count) strategy projects from disk (Output folder)."
+
+            // One-time Obsidian export for existing strategies (create missing + upgrade old format).
+            let root = outputRoot
+            let titleMap = Dictionary(uniqueKeysWithValues: papers.map { ($0.id, $0.title) })
+            Task.detached(priority: .utility) {
+                let fm = FileManager.default
+                let folder = root
+                    .appendingPathComponent("obsidian", isDirectory: true)
+                    .appendingPathComponent("strategies", isDirectory: true)
+
+                let existing = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
+
+                func existingFile(for token: String) -> URL? {
+                    existing.first(where: { $0.lastPathComponent.contains(token) })
+                }
+
+                func needsUpgrade(_ url: URL) -> Bool {
+                    guard let text = try? String(contentsOf: url, encoding: .utf8) else { return true }
+                    return !text.contains("obsidian_format_version: \(StrategyMarkdownExporter.obsidianFormatVersion)")
+                }
+
+                for project in loaded {
+                    let token = project.id.uuidString
+                    if let url = existingFile(for: token) {
+                        if !needsUpgrade(url) { continue }
+                    }
+                    _ = try? StrategyMarkdownExporter.write(project: project, outputRoot: root, paperTitlesByID: titleMap)
+                }
+            }
+        }
+    }
+
+    private func saveStrategyJSON(_ project: StrategyProject) throws -> URL {
+        let safeTitle = project.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let baseName = safeTitle.isEmpty ? "Strategy" : safeTitle
+        let sanitized = baseName.replacingOccurrences(of: "/", with: "-")
+        let fileName = "\(sanitized) [\(project.id.uuidString)].strategy.json"
+        let url = outputRoot.appendingPathComponent("strategies", isDirectory: true).appendingPathComponent(fileName)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted]
+        let data = try encoder.encode(project)
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
+    func createStrategyProject(from paperID: UUID) -> StrategyProject? {
+        guard let paper = papers.first(where: { $0.id == paperID }) else { return nil }
+
+        let base = paper.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = base.isEmpty ? "Strategy project" : base
+
+        let ideaText: String = {
+            if let verdict = paper.tradingLens?.oneLineVerdict?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !verdict.isEmpty {
+                return verdict
+            }
+            let blueprint = firstSentence(paper.strategyBlueprint ?? "")
+            if !blueprint.isEmpty { return blueprint }
+            return firstSentence(paper.summary)
+        }()
+        let hypotheses = paper.tradingLens?.alphaHypotheses?.compactMap { $0.hypothesis?.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+
+        var project = StrategyProject(
+            title: title,
+            paperIDs: [paperID],
+            idea: StrategyIdea(text: ideaText, hypotheses: hypotheses, assumptions: paper.assumptions),
+            tags: paper.tradingLens?.tradingTags
+        )
+        project.updatedAt = Date()
+        upsertStrategyProject(project)
+        _ = try? saveStrategyJSON(project)
+        let titleMap = Dictionary(uniqueKeysWithValues: papers.map { ($0.id, $0.title) })
+        _ = try? StrategyMarkdownExporter.write(project: project, outputRoot: outputRoot, paperTitlesByID: titleMap)
+        appendUserEvent(type: "strategy_project_created", paperID: paperID, extra: ["strategy_id": project.id.uuidString])
+        return project
+    }
+
+    func createEmptyStrategyProject(title: String = "New strategy") -> StrategyProject {
+        var project = StrategyProject(title: title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "New strategy" : title)
+        project.updatedAt = Date()
+        upsertStrategyProject(project)
+        _ = try? saveStrategyJSON(project)
+        let titleMap = Dictionary(uniqueKeysWithValues: papers.map { ($0.id, $0.title) })
+        _ = try? StrategyMarkdownExporter.write(project: project, outputRoot: outputRoot, paperTitlesByID: titleMap)
+        appendUserEvent(type: "strategy_project_created", paperID: nil, extra: ["strategy_id": project.id.uuidString])
+        return project
+    }
+
+    func updateStrategyProject(_ project: StrategyProject) {
+        var updated = project
+        updated.updatedAt = Date()
+        upsertStrategyProject(updated)
+        _ = try? saveStrategyJSON(updated)
+        let titleMap = Dictionary(uniqueKeysWithValues: papers.map { ($0.id, $0.title) })
+        _ = try? StrategyMarkdownExporter.write(project: updated, outputRoot: outputRoot, paperTitlesByID: titleMap)
+        appendUserEvent(type: "strategy_project_updated", paperID: nil, extra: ["strategy_id": updated.id.uuidString])
+    }
+
+    func deleteStrategyProject(_ strategyID: UUID) {
+        strategyProjects.removeAll(where: { $0.id == strategyID })
+        let fm = FileManager.default
+        let token = strategyID.uuidString
+        for root in dataRoots {
+            let folder = root.appendingPathComponent("strategies", isDirectory: true)
+            let candidates = (try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+            for url in candidates where url.lastPathComponent.contains(token) && url.lastPathComponent.hasSuffix(".strategy.json") {
+                try? fm.removeItem(at: url)
+            }
+
+            let mdFolder = root
+                .appendingPathComponent("obsidian", isDirectory: true)
+                .appendingPathComponent("strategies", isDirectory: true)
+            let mdCandidates = (try? fm.contentsOfDirectory(at: mdFolder, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])) ?? []
+            for url in mdCandidates where url.lastPathComponent.contains(token) && url.lastPathComponent.hasSuffix(".md") {
+                try? fm.removeItem(at: url)
+            }
+        }
+        appendUserEvent(type: "strategy_project_deleted", paperID: nil, extra: ["strategy_id": strategyID.uuidString])
+    }
+
+    func exportQuantKnowledgeGraphSnapshot() {
+        let snapshot = buildQuantKnowledgeGraphSnapshot()
+        let url = outputRoot
+            .appendingPathComponent("analytics", isDirectory: true)
+            .appendingPathComponent("quant_kg.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted]
+        encoder.dateEncodingStrategy = .iso8601
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            let data = try encoder.encode(snapshot)
+            try data.write(to: url, options: .atomic)
+            ingestionLog += "\n[analytics] Wrote quant_kg.json (\(snapshot.nodes.count) nodes, \(snapshot.edges.count) edges)."
+        } catch {
+            ingestionLog += "\n[analytics] Failed to write quant_kg.json: \(error.localizedDescription)"
+        }
+    }
+
+    private func buildQuantKnowledgeGraphSnapshot() -> QuantKnowledgeGraphSnapshot {
+        var nodes: [QuantKnowledgeGraphSnapshot.Node] = []
+        var edges: [QuantKnowledgeGraphSnapshot.Edge] = []
+        var seen: Set<String> = []
+
+        func addNode(_ node: QuantKnowledgeGraphSnapshot.Node) {
+            guard !seen.contains(node.id) else { return }
+            seen.insert(node.id)
+            nodes.append(node)
+        }
+
+        func addEdge(source: String, target: String, kind: QuantKnowledgeGraphSnapshot.EdgeKind, weight: Double? = nil, note: String? = nil) {
+            edges.append(.init(id: UUID(), source: source, target: target, kind: kind, weight: weight, note: note))
+        }
+
+        func makeID(prefix: String, _ id: UUID) -> String {
+            "\(prefix):\(id.uuidString)"
+        }
+
+        // Papers
+        for paper in papers {
+            let pid = makeID(prefix: "paper", paper.id)
+            var extra: [String: String] = [:]
+            if let year = paper.year { extra["year"] = String(year) }
+            if let cluster = paper.clusterIndex { extra["cluster"] = String(cluster) }
+            addNode(.init(id: pid, kind: .paper, label: paper.title, paperID: paper.id, strategyID: nil, extra: extra.isEmpty ? nil : extra))
+        }
+
+        // Paper→paper edges derived from claim relations (semantic influence).
+        let claimEdges = claimGraphEdges()
+        if !claimEdges.isEmpty {
+            var paperForClaim: [UUID: UUID] = [:]
+            for paper in papers {
+                for claim in paper.claims ?? [] {
+                    paperForClaim[claim.id] = paper.id
+                }
+            }
+            for edge in claimEdges {
+                guard let srcPaperID = paperForClaim[edge.sourceClaimID],
+                      let dstPaperID = paperForClaim[edge.targetClaimID] else { continue }
+                if srcPaperID == dstPaperID { continue }
+                let src = makeID(prefix: "paper", srcPaperID)
+                let dst = makeID(prefix: "paper", dstPaperID)
+                addEdge(source: src, target: dst, kind: .related, note: edge.kind.rawValue)
+            }
+        }
+
+        // Strategy projects
+        for project in strategyProjects {
+            let sid = makeID(prefix: "strategy", project.id)
+            addNode(.init(id: sid, kind: .strategy, label: project.title, paperID: nil, strategyID: project.id, extra: nil))
+
+            // Research links
+            for pid in project.paperIDs {
+                addEdge(source: sid, target: makeID(prefix: "paper", pid), kind: .referencesPaper)
+            }
+
+            // Idea
+            if let idea = project.idea, !idea.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let iid = makeID(prefix: "idea", project.id)
+                addNode(.init(id: iid, kind: .idea, label: firstSentence(idea.text), paperID: nil, strategyID: project.id, extra: nil))
+                addEdge(source: sid, target: iid, kind: .defines)
+            }
+
+            // Features
+            for feature in project.features {
+                let fid = makeID(prefix: "feature", feature.id)
+                addNode(.init(id: fid, kind: .feature, label: feature.name, paperID: nil, strategyID: project.id, extra: nil))
+                addEdge(source: sid, target: fid, kind: .defines)
+                for ref in feature.codeRefs ?? [] {
+                    let cid = makeID(prefix: "code", ref.id)
+                    addNode(.init(id: cid, kind: .code, label: ref.symbol ?? (URL(fileURLWithPath: ref.path).lastPathComponent), paperID: nil, strategyID: project.id, extra: ["path": ref.path]))
+                    addEdge(source: fid, target: cid, kind: .implementedInCode)
+                }
+            }
+
+            // Model
+            if let model = project.model {
+                let mid = makeID(prefix: "model", model.id)
+                addNode(.init(id: mid, kind: .model, label: model.name, paperID: nil, strategyID: project.id, extra: nil))
+                addEdge(source: sid, target: mid, kind: .defines)
+                for fid in model.featureIDs ?? [] {
+                    addEdge(source: mid, target: makeID(prefix: "feature", fid), kind: .usesFeature)
+                }
+                for ref in model.codeRefs ?? [] {
+                    let cid = makeID(prefix: "code", ref.id)
+                    addNode(.init(id: cid, kind: .code, label: ref.symbol ?? (URL(fileURLWithPath: ref.path).lastPathComponent), paperID: nil, strategyID: project.id, extra: ["path": ref.path]))
+                    addEdge(source: mid, target: cid, kind: .implementedInCode)
+                }
+            }
+
+            // Trade
+            if let trade = project.tradePlan {
+                let tid = makeID(prefix: "trade", trade.id)
+                let label = trade.horizon?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                    ? "Trade (\(trade.horizon ?? ""))"
+                    : "Trade"
+                addNode(.init(id: tid, kind: .trade, label: label, paperID: nil, strategyID: project.id, extra: nil))
+                addEdge(source: sid, target: tid, kind: .defines)
+                for ref in trade.codeRefs ?? [] {
+                    let cid = makeID(prefix: "code", ref.id)
+                    addNode(.init(id: cid, kind: .code, label: ref.symbol ?? (URL(fileURLWithPath: ref.path).lastPathComponent), paperID: nil, strategyID: project.id, extra: ["path": ref.path]))
+                    addEdge(source: tid, target: cid, kind: .implementedInCode)
+                }
+                for outcome in project.outcomes {
+                    addEdge(source: tid, target: makeID(prefix: "outcome", outcome.id), kind: .leadsTo)
+                }
+            }
+
+            // Decisions → Outcomes
+            for decision in project.decisions {
+                let did = makeID(prefix: "decision", decision.id)
+                addNode(.init(id: did, kind: .decision, label: decision.kind.label, paperID: nil, strategyID: project.id, extra: nil))
+                addEdge(source: sid, target: did, kind: .makesDecision)
+                if let modelID = decision.relatedModelID {
+                    addEdge(source: did, target: makeID(prefix: "model", modelID), kind: .usesModel)
+                }
+                for fid in decision.relatedFeatureIDs ?? [] {
+                    addEdge(source: did, target: makeID(prefix: "feature", fid), kind: .usesFeature)
+                }
+            }
+
+            for outcome in project.outcomes {
+                let oid = makeID(prefix: "outcome", outcome.id)
+                addNode(.init(id: oid, kind: .outcome, label: outcome.kind.label, paperID: nil, strategyID: project.id, extra: nil))
+                addEdge(source: sid, target: oid, kind: .leadsTo)
+            }
+
+            // Strategy-level code references
+            for ref in project.codeRefs ?? [] {
+                let cid = makeID(prefix: "code", ref.id)
+                addNode(.init(id: cid, kind: .code, label: ref.symbol ?? (URL(fileURLWithPath: ref.path).lastPathComponent), paperID: nil, strategyID: project.id, extra: ["path": ref.path]))
+                addEdge(source: sid, target: cid, kind: .implementedInCode)
+            }
+        }
+
+        return QuantKnowledgeGraphSnapshot(generatedAt: Date(), nodes: nodes, edges: edges)
     }
 
     private func loadSavedChunksIfNeeded() async {
@@ -705,6 +1101,7 @@ final class AppModel: ObservableObject {
         let repoRoot = outputRoot.deletingLastPathComponent()
         let script = repoRoot.appendingPathComponent("analytics/rebuild_analytics.py")
         persistClaimGraphEdgesSnapshot()
+        exportQuantKnowledgeGraphSnapshot()
 
         Task.detached { [weak self] in
             let args = ["--base", repoRoot.path]
@@ -869,8 +1266,8 @@ final class AppModel: ObservableObject {
             ]) { _, new in new }
 
             try process.run()
-            process.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             let output = String(data: data, encoding: .utf8) ?? ""
             return (process.terminationStatus, output, candidate.label)
         }
@@ -1066,6 +1463,7 @@ final class AppModel: ObservableObject {
                     id: clusterID,
                     name: info.name,
                     metaSummary: info.metaSummary,
+                    tradingLens: info.tradingLens,
                     centroid: centroid,
                     memberPaperIDs: members.map { $0.id },
                     layoutPosition: nil,
@@ -1079,6 +1477,7 @@ final class AppModel: ObservableObject {
                     id: clusterID,
                     name: "Cluster \(clusterID + 1)",
                     metaSummary: "Contains \(members.count) papers.",
+                    tradingLens: nil,
                     centroid: centroid,
                     memberPaperIDs: members.map { $0.id },
                     layoutPosition: nil,
@@ -1101,10 +1500,12 @@ final class AppModel: ObservableObject {
         ingestionLog += "\nClustering and meta-summaries complete."
         isClustering = false
         clusteringProgress = 1
+        recomputeExplorationCache()
 
         // Persist clusters snapshot
         clusterCache[cacheKey] = clusters
         persistClusterSnapshot(clusters, key: cacheKey)
+        exportObsidianVaultArtifacts(force: false)
     }
 
     /// Builds a three-level "Knowledge Galaxy":
@@ -1223,15 +1624,15 @@ final class AppModel: ObservableObject {
 
         let paperByID = Dictionary(uniqueKeysWithValues: updatedPapers.map { ($0.id, $0) })
 
-        var preservedNames: [Int: (name: String, metaSummary: String)] = [:]
+        var preservedNames: [Int: (name: String, metaSummary: String, tradingLens: String?)] = [:]
         for mega in megaClusters {
-            preservedNames[mega.id] = (mega.name, mega.metaSummary)
+            preservedNames[mega.id] = (mega.name, mega.metaSummary, mega.tradingLens)
             for sub in mega.subclusters ?? [] {
-                preservedNames[sub.id] = (sub.name, sub.metaSummary)
+                preservedNames[sub.id] = (sub.name, sub.metaSummary, sub.tradingLens)
             }
         }
         for sub in clusters {
-            preservedNames[sub.id] = (sub.name, sub.metaSummary)
+            preservedNames[sub.id] = (sub.name, sub.metaSummary, sub.tradingLens)
         }
         let preservedSources = clusterNameSources
         var newNameSources: [Int: ClusterNameSource] = [:]
@@ -1246,20 +1647,24 @@ final class AppModel: ObservableObject {
             let source = preservedSources[info.id] ?? .heuristic
             let mergedName: String
             let mergedMeta: String
+            let mergedLens: String?
             if (source == .manual || source == .ai),
                let override = preservedNames[info.id] {
                 mergedName = override.name
                 mergedMeta = override.metaSummary
+                mergedLens = override.tradingLens
                 newNameSources[info.id] = source
             } else {
                 mergedName = heuristic.name
                 mergedMeta = heuristic.metaSummary
+                mergedLens = nil
                 newNameSources[info.id] = .heuristic
             }
             return Cluster(
                 id: info.id,
                 name: mergedName,
                 metaSummary: mergedMeta,
+                tradingLens: mergedLens,
                 centroid: info.centroid,
                 memberPaperIDs: info.memberPaperIDs,
                 layoutPosition: info.layoutPosition,
@@ -1281,20 +1686,24 @@ final class AppModel: ObservableObject {
             let source = preservedSources[info.id] ?? .heuristic
             let mergedName: String
             let mergedMeta: String
+            let mergedLens: String?
             if (source == .manual || source == .ai),
                let override = preservedNames[info.id] {
                 mergedName = override.name
                 mergedMeta = override.metaSummary
+                mergedLens = override.tradingLens
                 newNameSources[info.id] = source
             } else {
                 mergedName = heuristic.name
                 mergedMeta = heuristic.metaSummary
+                mergedLens = nil
                 newNameSources[info.id] = .heuristic
             }
             return Cluster(
                 id: info.id,
                 name: mergedName,
                 metaSummary: mergedMeta,
+                tradingLens: mergedLens,
                 centroid: info.centroid,
                 memberPaperIDs: info.memberPaperIDs,
                 layoutPosition: info.layoutPosition,
@@ -1315,6 +1724,8 @@ final class AppModel: ObservableObject {
 
         isClustering = false
         clusteringProgress = 1
+        recomputeExplorationCache()
+        exportObsidianVaultArtifacts(force: false)
     }
 
     // MARK: - Galaxy glossary helpers
@@ -1394,24 +1805,27 @@ final class AppModel: ObservableObject {
         persistGalaxySnapshot(version: currentCorpusVersion(), megaClusters: megaClusters)
     }
 
-    private func setGalaxyClusterFields(clusterID: Int, name: String, metaSummary: String?) {
+    private func setGalaxyClusterFields(clusterID: Int, name: String, metaSummary: String?, tradingLens: String? = nil) {
         let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedName.isEmpty else { return }
 
         if let idx = clusters.firstIndex(where: { $0.id == clusterID }) {
             clusters[idx].name = trimmedName
             if let metaSummary { clusters[idx].metaSummary = metaSummary }
+            if let tradingLens { clusters[idx].tradingLens = tradingLens }
         }
 
         for megaIdx in megaClusters.indices {
             if megaClusters[megaIdx].id == clusterID {
                 megaClusters[megaIdx].name = trimmedName
                 if let metaSummary { megaClusters[megaIdx].metaSummary = metaSummary }
+                if let tradingLens { megaClusters[megaIdx].tradingLens = tradingLens }
             }
             if megaClusters[megaIdx].subclusters != nil,
                let subIdx = megaClusters[megaIdx].subclusters?.firstIndex(where: { $0.id == clusterID }) {
                 megaClusters[megaIdx].subclusters?[subIdx].name = trimmedName
                 if let metaSummary { megaClusters[megaIdx].subclusters?[subIdx].metaSummary = metaSummary }
+                if let tradingLens { megaClusters[megaIdx].subclusters?[subIdx].tradingLens = tradingLens }
             }
         }
     }
@@ -1472,7 +1886,7 @@ final class AppModel: ObservableObject {
 
         do {
             let info = try await clusterSummarizer.summarizeCluster(index: clusterID, summaries: entries)
-            setGalaxyClusterFields(clusterID: clusterID, name: info.name, metaSummary: info.metaSummary)
+            setGalaxyClusterFields(clusterID: clusterID, name: info.name, metaSummary: info.metaSummary, tradingLens: info.tradingLens)
             clusterNameSources[clusterID] = .ai
         } catch {
             logger.error("Failed to name cluster \(clusterID): \(error.localizedDescription, privacy: .public)")
@@ -1541,7 +1955,7 @@ final class AppModel: ObservableObject {
             meta = "Key themes: \(themes). Sample: \(sample)."
         }
 
-        return ClusterSummary(name: name, metaSummary: meta)
+        return ClusterSummary(name: name, metaSummary: meta, tradingLens: nil)
     }
 
     private func persistGalaxySnapshot(version: String, megaClusters: [Cluster]) {
@@ -1672,6 +2086,177 @@ final class AppModel: ObservableObject {
 
         ingestionLog += "\nExported galaxy report: \(reportURL.lastPathComponent)"
         return (jsonURL: jsonURL, reportURL: reportURL)
+    }
+
+    // MARK: - Obsidian vault export
+
+    private func paperObsidianContextSnapshot() -> PaperMarkdownExporter.Context {
+        let allClusters = AppModel.flattenClustersForObsidian(megaClusters: megaClusters, clusters: clusters)
+        return PaperMarkdownExporter.Context(allPapers: papers, clusters: allClusters, clusterNameSources: clusterNameSources)
+    }
+
+    func obsidianNoteURL(for paperID: UUID) -> URL? {
+        let folder = outputRoot
+            .appendingPathComponent("obsidian", isDirectory: true)
+            .appendingPathComponent("papers", isDirectory: true)
+
+        let token = paperID.uuidString.uppercased()
+        let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
+        return files.first(where: { url in
+            url.pathExtension.lowercased() == "md" && url.lastPathComponent.uppercased().contains(token)
+        })
+    }
+
+    func obsidianStrategyNoteURL(for strategyID: UUID) -> URL? {
+        let folder = outputRoot
+            .appendingPathComponent("obsidian", isDirectory: true)
+            .appendingPathComponent("strategies", isDirectory: true)
+
+        let token = strategyID.uuidString.uppercased()
+        let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
+        return files.first(where: { url in
+            url.pathExtension.lowercased() == "md" && url.lastPathComponent.uppercased().contains(token)
+        })
+    }
+
+    private func exportObsidianVaultArtifacts(force: Bool) {
+        let root = outputRoot
+        let papersSnapshot = papers
+        let clustersSnapshot = clusters
+        let megaClustersSnapshot = megaClusters
+        let sourcesSnapshot = clusterNameSources
+        let pinnedSnapshot = pinnedClusterIDs
+        let strategySnapshot = strategyProjects
+        let corpusVersion = currentCorpusVersion()
+        let allClustersSnapshot = AppModel.flattenClustersForObsidian(megaClusters: megaClustersSnapshot, clusters: clustersSnapshot)
+        let papersByIDSnapshot = Dictionary(uniqueKeysWithValues: papersSnapshot.map { ($0.id, $0) })
+        let paperContextSnapshot = PaperMarkdownExporter.Context(allPapers: papersSnapshot, clusters: allClustersSnapshot, clusterNameSources: sourcesSnapshot)
+
+        Task.detached(priority: .utility) {
+            let fm = FileManager.default
+            let papersByID = papersByIDSnapshot
+            let allClusters = allClustersSnapshot
+            let paperContext = paperContextSnapshot
+
+            func extractBracketToken(from fileName: String) -> String? {
+                guard let start = fileName.lastIndex(of: "["),
+                      let end = fileName.lastIndex(of: "]"),
+                      start < end else {
+                    return nil
+                }
+                let token = fileName[fileName.index(after: start)..<end]
+                return String(token)
+            }
+
+            // Clusters
+            for cluster in allClusters {
+                _ = try? ClusterMarkdownExporter.write(
+                    cluster: cluster,
+                    outputRoot: root,
+                    papersByID: papersByID,
+                    nameSource: sourcesSnapshot[cluster.id]
+                )
+            }
+
+            // Atlas dashboard
+            _ = try? AtlasMarkdownExporter.write(
+                outputRoot: root,
+                corpusVersion: corpusVersion,
+                papers: papersSnapshot,
+                clusters: clustersSnapshot,
+                megaClusters: megaClustersSnapshot,
+                clusterNameSources: sourcesSnapshot,
+                pinnedClusterIDs: pinnedSnapshot,
+                strategyProjects: strategySnapshot
+            )
+
+            // Vault assets (CSS snippet + setup note)
+            _ = try? ObsidianVaultAssetsExporter.write(outputRoot: root)
+
+            // Papers (upgrade old format or regenerate on force)
+            let paperFolder = root.appendingPathComponent("obsidian", isDirectory: true).appendingPathComponent("papers", isDirectory: true)
+            let paperFiles = (try? fm.contentsOfDirectory(at: paperFolder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
+
+            func paperFileByID() -> [String: URL] {
+                var map: [String: URL] = [:]
+                for url in paperFiles {
+                    let name = url.lastPathComponent
+                    if let token = extractBracketToken(from: name), UUID(uuidString: token) != nil {
+                        map[token.uppercased()] = url
+                    }
+                }
+                return map
+            }
+            let paperFileMap = paperFileByID()
+
+            func needsPaperRefresh(_ url: URL, paper: Paper) -> Bool {
+                guard let text = try? String(contentsOf: url, encoding: .utf8) else { return true }
+                if !text.contains("obsidian_format_version: \(PaperMarkdownExporter.obsidianFormatVersion)") {
+                    return true
+                }
+                if let cid = paper.clusterIndex,
+                   paperContext.clustersByID[cid] != nil,
+                   !text.contains("[[\(ObsidianIDs.clusterAlias(cid))") {
+                    return true
+                }
+                return false
+            }
+
+            for paper in papersSnapshot {
+                let key = paper.id.uuidString.uppercased()
+                if let existing = paperFileMap[key] {
+                    if !force, !needsPaperRefresh(existing, paper: paper) { continue }
+                } else if !force {
+                    // File missing.
+                }
+                _ = try? PaperMarkdownExporter.write(paper: paper, outputRoot: root, context: paperContext)
+            }
+
+            // Strategies (upgrade old format or regenerate on force)
+            let titleMap = Dictionary(uniqueKeysWithValues: papersSnapshot.map { ($0.id, $0.title) })
+            let strategyFolder = root.appendingPathComponent("obsidian", isDirectory: true).appendingPathComponent("strategies", isDirectory: true)
+            let strategyFiles = (try? fm.contentsOfDirectory(at: strategyFolder, includingPropertiesForKeys: [.isRegularFileKey], options: [.skipsHiddenFiles])) ?? []
+
+            func strategyFileByID() -> [String: URL] {
+                var map: [String: URL] = [:]
+                for url in strategyFiles {
+                    let name = url.lastPathComponent
+                    if let token = extractBracketToken(from: name), UUID(uuidString: token) != nil {
+                        map[token.uppercased()] = url
+                    }
+                }
+                return map
+            }
+            let strategyFileMap = strategyFileByID()
+
+            func needsStrategyUpgrade(_ url: URL) -> Bool {
+                guard let text = try? String(contentsOf: url, encoding: .utf8) else { return true }
+                return !text.contains("obsidian_format_version: \(StrategyMarkdownExporter.obsidianFormatVersion)")
+            }
+
+            for project in strategySnapshot {
+                let key = project.id.uuidString.uppercased()
+                if let existing = strategyFileMap[key] {
+                    if !force, !needsStrategyUpgrade(existing) { continue }
+                } else if !force {
+                    // File missing.
+                }
+                _ = try? StrategyMarkdownExporter.write(project: project, outputRoot: root, paperTitlesByID: titleMap)
+            }
+        }
+    }
+
+    private static func flattenClustersForObsidian(megaClusters: [Cluster], clusters: [Cluster]) -> [Cluster] {
+        var byID: [Int: Cluster] = [:]
+
+        func add(_ cluster: Cluster) {
+            byID[cluster.id] = cluster
+            for sub in cluster.subclusters ?? [] { add(sub) }
+        }
+
+        for mega in megaClusters { add(mega) }
+        for sub in clusters { add(sub) }
+        return Array(byID.values)
     }
 
     // MARK: - Corpus synthesis (briefing)
@@ -2437,7 +3022,7 @@ final class AppModel: ObservableObject {
         }
 
         _ = try? savePaperJSON(papers[idx])
-        _ = try? PaperMarkdownExporter.write(paper: papers[idx], outputRoot: outputRoot)
+        _ = try? PaperMarkdownExporter.write(paper: papers[idx], outputRoot: outputRoot, context: paperObsidianContextSnapshot())
         savePaperIndex()
         await MainActor.run {
             recomputeReadingProfile(extra: nil)
@@ -2468,8 +3053,8 @@ final class AppModel: ObservableObject {
         let template = PromptStore.loadText("ui.flashcards.prompt.md", fallback: fallbackTemplate)
         let prompt = PromptStore.render(template: template, variables: [
             "title": paper.title,
-            "summary": paper.summary,
-            "takeaways": paper.takeaways?.joined(separator: "\n") ?? ""
+            "summary": LLMText.clip(paper.summary, maxChars: 2000),
+            "takeaways": LLMText.clip(paper.takeaways?.joined(separator: "\n") ?? "", maxChars: 900)
         ])
         do {
             let session = LanguageModelSession(instructions: instructions)
@@ -2503,7 +3088,7 @@ final class AppModel: ObservableObject {
                 papers[idx].flashcards = fcs
             }
             _ = try? savePaperJSON(papers[idx])
-            _ = try? PaperMarkdownExporter.write(paper: papers[idx], outputRoot: outputRoot)
+            _ = try? PaperMarkdownExporter.write(paper: papers[idx], outputRoot: outputRoot, context: paperObsidianContextSnapshot())
         } catch {
             ingestionLog += "\nFlashcards failed for \(paper.title): \(error.localizedDescription)"
         }
@@ -2536,12 +3121,230 @@ final class AppModel: ObservableObject {
                 .filter { !$0.isEmpty }
             papers[idx].userQuestions = questions
             _ = try? savePaperJSON(papers[idx])
-            _ = try? PaperMarkdownExporter.write(paper: papers[idx], outputRoot: outputRoot)
+            _ = try? PaperMarkdownExporter.write(paper: papers[idx], outputRoot: outputRoot, context: paperObsidianContextSnapshot())
         } catch {
             ingestionLog += "\nQuestion generation failed for \(paper.title): \(error.localizedDescription)"
         }
         await MainActor.run {
             recomputeReadingProfile(extra: nil)
+        }
+    }
+
+    func generateTradingLens(for paperID: UUID) {
+        Task { await runTradingLens(for: paperID) }
+    }
+
+    func backfillTradingLensForMissingPapers(limit: Int? = nil) {
+        tradingLensBackfillTask?.cancel()
+        tradingLensBackfillTask = Task { await runTradingLensBackfill(limit: limit) }
+    }
+
+    func cancelTradingLensBackfill() {
+        tradingLensBackfillTask?.cancel()
+    }
+
+    private func runTradingLensBackfill(limit: Int? = nil) async {
+        defer {
+            tradingLensBackfillInFlight = false
+            tradingLensBackfillCurrentPaper = ""
+            tradingLensBackfillTask = nil
+        }
+
+        let candidates = papers
+            .filter { paper in
+                if paper.tradingLens == nil { return true }
+                return (paper.tradingScores ?? paper.tradingLens?.scores) == nil
+            }
+            .sorted { lhs, rhs in
+                let ly = lhs.year ?? -10_000
+                let ry = rhs.year ?? -10_000
+                if ly != ry { return ly > ry }
+                return lhs.title < rhs.title
+            }
+
+        let ids = Array(candidates.prefix(limit ?? Int.max).map(\.id))
+        guard !ids.isEmpty else { return }
+
+        tradingLensBackfillInFlight = true
+        tradingLensBackfillProgress = 0
+        tradingLensBackfillCompletedCount = 0
+        tradingLensBackfillTotalCount = ids.count
+
+        ingestionLog += "\n[>] Trading lens backfill: \(ids.count) papers…"
+
+        for (i, paperID) in ids.enumerated() {
+            if Task.isCancelled { break }
+            if let paper = papers.first(where: { $0.id == paperID }) {
+                tradingLensBackfillCurrentPaper = paper.title
+            } else {
+                tradingLensBackfillCurrentPaper = ""
+            }
+
+            await runTradingLens(for: paperID)
+
+            tradingLensBackfillCompletedCount = i + 1
+            tradingLensBackfillProgress = Double(i + 1) / Double(max(1, ids.count))
+        }
+
+        if Task.isCancelled {
+            ingestionLog += "\n[>] Trading lens backfill cancelled after \(tradingLensBackfillCompletedCount)/\(tradingLensBackfillTotalCount)."
+        } else {
+            ingestionLog += "\n[✓] Trading lens backfill complete: \(tradingLensBackfillCompletedCount)/\(tradingLensBackfillTotalCount)."
+            appendUserEvent(type: "trading_lens_backfill_complete", paperID: nil, extra: [
+                "completed": tradingLensBackfillCompletedCount,
+                "total": tradingLensBackfillTotalCount
+            ])
+        }
+    }
+
+    private func runTradingLens(for paperID: UUID) async {
+        guard let idx = papers.firstIndex(where: { $0.id == paperID }) else { return }
+        let paper = papers[idx]
+        do {
+            let lens = try await tradingLensActor.scorecard(
+                title: paper.title,
+                keywords: paper.keywords,
+                summary: paper.summary,
+                takeaways: paper.takeaways
+            )
+            papers[idx].tradingLens = lens
+            papers[idx].tradingScores = lens.scores
+            tradingLensFailures.removeValue(forKey: paperID)
+            _ = try? savePaperJSON(papers[idx])
+            _ = try? PaperMarkdownExporter.write(paper: papers[idx], outputRoot: outputRoot, context: paperObsidianContextSnapshot())
+            appendUserEvent(type: "trading_lens_ready", paperID: paperID, extra: [:])
+        } catch {
+            ingestionLog += "\nTrading lens failed for \(paper.title): \(error.localizedDescription)"
+            tradingLensFailures[paperID] = error.localizedDescription
+        }
+    }
+
+    func generateStrategyBlueprint(for paperID: UUID) {
+        Task { await runStrategyBlueprint(for: paperID) }
+    }
+
+    private func runStrategyBlueprint(for paperID: UUID) async {
+        guard let idx = papers.firstIndex(where: { $0.id == paperID }) else { return }
+        let paper = papers[idx]
+
+        let fallbackInstructions = """
+        You are a senior quant researcher. Convert paper context into 1-2 concrete strategy prototypes.
+        Be grounded: treat as hypotheses. Do not invent numerical results.
+        Output must be Markdown with clear structure and short, actionable bullets.
+        """
+        let instructions = PromptStore.loadText("strategy_blueprint.instructions.md", fallback: fallbackInstructions)
+
+        let fallbackTemplate = """
+        Paper:
+        Title: {{title}}
+        Keywords: {{keywords}}
+        Summary:
+        {{summary}}
+
+        Trading lens (may be JSON or text):
+        {{trading_lens}}
+
+        Write 1-2 prototypes with these headings:
+
+        # Prototype 1
+        ## Alpha hypothesis
+        ## Universe & horizon
+        ## Signal definition (math / pseudocode)
+        ## Model (if any) + features
+        ## Portfolio construction + constraints
+        ## Transaction cost / slippage assumptions
+        ## Evaluation plan (metrics + splits)
+        ## Robustness checks
+        ## Fast implementation steps (5-8 bullets)
+
+        (Repeat for Prototype 2 if useful.)
+
+        Rules:
+        - If you must assume something (e.g., horizon), label it explicitly.
+        - Include at least 3 robustness checks.
+        """
+        let template = PromptStore.loadText("strategy_blueprint.prompt.md", fallback: fallbackTemplate)
+
+        let lensText: String = {
+            guard let lens = paper.tradingLens else { return "Unknown" }
+            if let data = try? JSONEncoder().encode(lens),
+               let json = String(data: data, encoding: .utf8),
+               !json.isEmpty {
+                return json
+            }
+            return "Unknown"
+        }()
+
+        let prompt = PromptStore.render(template: template, variables: [
+            "title": paper.title,
+            "keywords": (paper.keywords ?? []).joined(separator: ", "),
+            "summary": LLMText.clip(paper.summary, maxChars: 2400),
+            "trading_lens": LLMText.clip(lensText, maxChars: 2400)
+        ])
+
+        do {
+            let session = LanguageModelSession(instructions: instructions)
+            let response = try await session.respond(to: prompt)
+            papers[idx].strategyBlueprint = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            papers[idx].backtestAudit = nil
+            _ = try? savePaperJSON(papers[idx])
+            _ = try? PaperMarkdownExporter.write(paper: papers[idx], outputRoot: outputRoot, context: paperObsidianContextSnapshot())
+            appendUserEvent(type: "strategy_blueprint_ready", paperID: paperID, extra: [:])
+        } catch {
+            ingestionLog += "\nStrategy blueprint failed for \(paper.title): \(error.localizedDescription)"
+        }
+    }
+
+    func auditBacktest(for paperID: UUID) {
+        Task { await runBacktestAudit(for: paperID) }
+    }
+
+    private func runBacktestAudit(for paperID: UUID) async {
+        guard let idx = papers.firstIndex(where: { $0.id == paperID }) else { return }
+        let paper = papers[idx]
+        guard let blueprint = paper.strategyBlueprint, !blueprint.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            ingestionLog += "\nBacktest audit skipped for \(paper.title): no strategy blueprint yet."
+            return
+        }
+
+        let fallbackInstructions = """
+        You are a quant backtesting auditor. Your goal is to find hidden leakage, bias, unrealistic assumptions, and fragility.
+        Be practical and concrete. Prefer checklists.
+        Do not require proprietary infrastructure; propose minimal fixes.
+        """
+        let instructions = PromptStore.loadText("ui.backtest_audit.instructions.md", fallback: fallbackInstructions)
+
+        let fallbackTemplate = """
+        Strategy / prototype description:
+        {{strategy_text}}
+
+        Audit it with these headings:
+
+        # Leakage & Bias Risks
+        # Data Assumption Risks
+        # Transaction Costs & Market Impact
+        # Regime & Non-Stationarity
+        # Overfitting & Validation Design
+        # Minimal Fixes (Actionable)
+        # Kill Criteria (When to Stop)
+
+        Keep it punchy: bullets, not essays.
+        """
+        let template = PromptStore.loadText("ui.backtest_audit.prompt.md", fallback: fallbackTemplate)
+
+        let prompt = PromptStore.render(template: template, variables: [
+            "strategy_text": String(blueprint.prefix(6000))
+        ])
+
+        do {
+            let session = LanguageModelSession(instructions: instructions)
+            let response = try await session.respond(to: prompt)
+            papers[idx].backtestAudit = response.content.trimmingCharacters(in: .whitespacesAndNewlines)
+            _ = try? savePaperJSON(papers[idx])
+            _ = try? PaperMarkdownExporter.write(paper: papers[idx], outputRoot: outputRoot, context: paperObsidianContextSnapshot())
+            appendUserEvent(type: "backtest_audit_ready", paperID: paperID, extra: [:])
+        } catch {
+            ingestionLog += "\nBacktest audit failed for \(paper.title): \(error.localizedDescription)"
         }
     }
 
@@ -2569,7 +3372,7 @@ final class AppModel: ObservableObject {
         flashcards[cIdx].reviewCount = (flashcards[cIdx].reviewCount ?? 0) + 1
         papers[pIdx].flashcards = flashcards
         _ = try? savePaperJSON(papers[pIdx])
-        _ = try? PaperMarkdownExporter.write(paper: papers[pIdx], outputRoot: outputRoot)
+        _ = try? PaperMarkdownExporter.write(paper: papers[pIdx], outputRoot: outputRoot, context: paperObsidianContextSnapshot())
         appendUserEvent(type: "flashcard_reviewed", paperID: paperID, extra: ["card_id": cardID.uuidString])
     }
 
@@ -2633,6 +3436,34 @@ final class AppModel: ObservableObject {
             scored.append(ScoredPaper(paper: paper, score: score))
         }
         return Array(scored.sorted { $0.score > $1.score }.prefix(limit).map { $0.paper })
+    }
+
+    /// Rank unread papers by trading applicability: strategy_impact * usability * confidence (optionally novelty as tie-breaker).
+    func tradingPriorityPapers(limit: Int = 5) -> [Paper] {
+        let unread = papers.filter { $0.readingStatus != .done }
+        let scored: [(paper: Paper, priority: Double, novelty: Double)] = unread.compactMap { paper in
+            guard let scores = paper.tradingScores ?? paper.tradingLens?.scores else { return nil }
+            let impact = scores.strategyImpact ?? 0
+            let usability = scores.usability ?? 0
+            let confidence = scores.confidence ?? 0
+            let novelty = scores.novelty ?? 0
+            let priority = impact * usability * confidence
+            guard priority > 0 else { return nil }
+            return (paper: paper, priority: priority, novelty: novelty)
+        }
+        return Array(
+            scored
+                .sorted { l, r in
+                    if l.priority != r.priority { return l.priority > r.priority }
+                    if l.novelty != r.novelty { return l.novelty > r.novelty }
+                    let ly = l.paper.year ?? -10_000
+                    let ry = r.paper.year ?? -10_000
+                    if ly != ry { return ly > ry }
+                    return l.paper.title < r.paper.title
+                }
+                .prefix(limit)
+                .map { $0.paper }
+        )
     }
 
     private func meanEmbedding(for papers: [Paper]) -> [Float]? {
@@ -3228,8 +4059,14 @@ final class AppModel: ObservableObject {
     }
 
     private func aiDebate(left: DebateContext, right: DebateContext, rounds: Int) async throws -> String {
-        let leftSnippets = left.exemplars.map { "- \($0.title): \($0.snippet)" }.joined(separator: "\n")
-        let rightSnippets = right.exemplars.map { "- \($0.title): \($0.snippet)" }.joined(separator: "\n")
+        let leftSnippets = left.exemplars
+            .prefix(4)
+            .map { "- \(LLMText.clip($0.title, maxChars: 120)): \(LLMText.clip(LLMText.collapseWhitespace($0.snippet), maxChars: 260))" }
+            .joined(separator: "\n")
+        let rightSnippets = right.exemplars
+            .prefix(4)
+            .map { "- \(LLMText.clip($0.title, maxChars: 120)): \(LLMText.clip(LLMText.collapseWhitespace($0.snippet), maxChars: 260))" }
+            .joined(separator: "\n")
 
         let fallbackInstructions = "You simulate debate transcripts between research ideas; you stay grounded in provided summaries."
         let instructions = PromptStore.loadText("ui.debate.instructions.md", fallback: fallbackInstructions)
@@ -3259,10 +4096,10 @@ final class AppModel: ObservableObject {
         let template = PromptStore.loadText("ui.debate.prompt.md", fallback: fallbackTemplate)
         let prompt = PromptStore.render(template: template, variables: [
             "left_title": left.title,
-            "left_summary": left.summary,
+            "left_summary": LLMText.clip(left.summary, maxChars: 1100),
             "left_snippets": leftSnippets.isEmpty ? "(none)" : leftSnippets,
             "right_title": right.title,
-            "right_summary": right.summary,
+            "right_summary": LLMText.clip(right.summary, maxChars: 1100),
             "right_snippets": rightSnippets.isEmpty ? "(none)" : rightSnippets,
             "rounds": String(rounds),
             "steps": String(rounds * 2)

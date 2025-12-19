@@ -43,6 +43,35 @@ private enum MapPalette {
         let colors = palette[index % palette.count]
         return LinearGradient(colors: colors, startPoint: .topLeading, endPoint: .bottomTrailing)
     }
+
+    static func categoricalTint(for key: String) -> Color {
+        let cleaned = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.isEmpty || cleaned.lowercased() == "unknown" {
+            return Color.white.opacity(0.55)
+        }
+        let palette: [Color] = [
+            Color(red: 0.98, green: 0.78, blue: 0.18), // gold
+            Color(red: 0.50, green: 0.83, blue: 0.98), // cyan
+            Color(red: 0.74, green: 0.65, blue: 1.00), // lavender
+            Color(red: 0.71, green: 0.93, blue: 0.76), // mint
+            Color(red: 1.00, green: 0.64, blue: 0.79), // pink
+            Color(red: 0.96, green: 0.50, blue: 0.28), // orange
+            Color(red: 0.45, green: 0.93, blue: 0.88), // teal
+            Color(red: 0.92, green: 0.92, blue: 0.46), // lemon
+            Color(red: 0.64, green: 0.80, blue: 0.31), // lime
+            Color(red: 0.62, green: 0.54, blue: 0.98)  // violet
+        ]
+        let idx = abs(stableHash(cleaned)) % palette.count
+        return palette[idx].opacity(0.85)
+    }
+
+    private static func stableHash(_ s: String) -> Int {
+        var h: UInt64 = 5381
+        for scalar in s.unicodeScalars {
+            h = ((h << 5) &+ h) &+ UInt64(scalar.value)
+        }
+        return Int(truncatingIfNeeded: h)
+    }
 }
 
 private enum ClusterResolution: String, CaseIterable {
@@ -75,6 +104,91 @@ private enum ZoomLevel: Int, CaseIterable {
         case .mega: return "Mega-topics"
         case .topics: return "Subtopics"
         case .papers: return "Papers"
+        }
+    }
+}
+
+private enum PaperStatusFilter: String, CaseIterable, Identifiable {
+    case all
+    case unread
+    case inProgress
+    case done
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .all: return "All"
+        case .unread: return "Unread"
+        case .inProgress: return "In progress"
+        case .done: return "Done"
+        }
+    }
+
+    func matches(_ paper: Paper) -> Bool {
+        guard self != .all else { return true }
+        let status = paper.readingStatus ?? .unread
+        switch self {
+        case .all: return true
+        case .unread: return status == .unread
+        case .inProgress: return status == .inProgress
+        case .done: return status == .done
+        }
+    }
+}
+
+private enum PaperSort: String, CaseIterable, Identifiable {
+    case recommended
+    case recency
+    case title
+    case noveltyZ
+    case consensusZ
+    case influencePos
+    case clusterConfidence
+    case recombination
+    case rigor
+    case openness
+    case tradingPriority
+    case tradingImpact
+    case tradingUsability
+    case tradingNovelty
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .recommended: return "Recommended"
+        case .recency: return "Recency"
+        case .title: return "Title"
+        case .noveltyZ: return "Novelty (z)"
+        case .consensusZ: return "Consensus (z)"
+        case .influencePos: return "Influence (+)"
+        case .clusterConfidence: return "Cluster confidence"
+        case .recombination: return "Recombination"
+        case .rigor: return "Rigor proxy"
+        case .openness: return "Openness"
+        case .tradingPriority: return "Trading priority"
+        case .tradingImpact: return "Trading impact"
+        case .tradingUsability: return "Trading usability"
+        case .tradingNovelty: return "Trading novelty"
+        }
+    }
+}
+
+private enum PaperColorBy: String, CaseIterable, Identifiable {
+    case novelty
+    case tradingTag
+    case assetClass
+    case horizon
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .novelty: return "Novelty"
+        case .tradingTag: return "Trading tag"
+        case .assetClass: return "Asset class"
+        case .horizon: return "Horizon"
         }
     }
 }
@@ -122,6 +236,13 @@ struct MapView: View {
     @State private var selectedClusterIDs: Set<Int> = []
     @State private var selectedPaper: Paper?
     @State private var paperHighlights: [UUID: PaperNoveltyScore] = [:]
+    @State private var paperSearchQuery: String = ""
+    @State private var paperSort: PaperSort = .recommended
+    @State private var paperStatusFilter: PaperStatusFilter = .all
+    @State private var selectedTradingTags: Set<String> = []
+    @State private var selectedAssetClasses: Set<String> = []
+    @State private var selectedHorizons: Set<String> = []
+    @State private var paperColorBy: PaperColorBy = .novelty
     @State private var isNamingSubtopics: Bool = false
     @State private var isNamingMegaTopics: Bool = false
     @State private var debateText: String = ""
@@ -161,10 +282,21 @@ struct MapView: View {
         }
     }
 
+    private var paperSubtopics: [Cluster] {
+        let fallback = model.megaClusters.first?.subclusters ?? model.clusters
+        let base = selectedMegaCluster?.subclusters ?? fallback
+        return model.lensAdjustedClusters(base, lens: lens)
+    }
+
     private var activePapers: [Paper] {
         guard zoomLevel == .papers else { return [] }
         guard let sub = selectedSubtopicCluster else { return [] }
-        return model.explorationPapers.filter { $0.clusterIndex == sub.id }
+        return model.explorationPapers(in: sub).sorted {
+            let ly = $0.year ?? -10_000
+            let ry = $1.year ?? -10_000
+            if ly != ry { return ly > ry }
+            return $0.title < $1.title
+        }
     }
 
     private var activePaperDriftVector: (dx: Double, dy: Double)? {
@@ -265,14 +397,26 @@ struct MapView: View {
                                 .foregroundStyle(.white.opacity(0.7))
                             Spacer()
                         } else if zoomLevel == .papers {
-                            PaperScatterView(
-                                papers: activePapers,
-                                highlights: paperHighlights,
-                                driftVector: activePaperDriftVector,
-                                onSelectPaper: { paper in
-                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                                        selectedPaper = paper
-                                    }
+	                            PaperMapAndSidebar(
+	                                cluster: selectedSubtopicCluster,
+	                                subtopics: paperSubtopics,
+	                                papers: activePapers,
+	                                highlights: paperHighlights,
+	                                driftVector: activePaperDriftVector,
+	                                searchQuery: $paperSearchQuery,
+	                                statusFilter: $paperStatusFilter,
+	                                sort: $paperSort,
+	                                selectedTradingTags: $selectedTradingTags,
+	                                selectedAssetClasses: $selectedAssetClasses,
+	                                selectedHorizons: $selectedHorizons,
+	                                colorBy: $paperColorBy,
+	                                onSelectPaper: { paper in
+	                                    withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+	                                        selectedPaper = paper
+	                                    }
+                                },
+                                onSelectSubtopic: { cluster in
+                                    selectSubtopic(cluster)
                                 }
                             )
                             .frame(minHeight: 360)
@@ -706,11 +850,22 @@ struct MapView: View {
         }
     }
 
+    private func megaID(containingSubtopic subtopicID: Int) -> Int? {
+        for mega in model.megaClusters {
+            if mega.subclusters?.contains(where: { $0.id == subtopicID }) == true {
+                return mega.id
+            }
+        }
+        return nil
+    }
+
     private func selectSubtopic(_ cluster: Cluster) {
         withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+            selectedMegaID = megaID(containingSubtopic: cluster.id) ?? selectedMegaID
             selectedSubtopicID = cluster.id
             selectedClusterIDs = [cluster.id]
             zoomLevel = .papers
+            paperSearchQuery = ""
         }
     }
 }
@@ -830,6 +985,642 @@ struct ClusterMapAndSidebar: View {
             }
             .frame(width: 380)
         }
+    }
+}
+
+@available(macOS 26, iOS 26, *)
+private struct PaperMapAndSidebar: View {
+    @EnvironmentObject private var model: AppModel
+    let cluster: Cluster?
+    let subtopics: [Cluster]
+    let papers: [Paper]
+    let highlights: [UUID: PaperNoveltyScore]
+    let driftVector: (dx: Double, dy: Double)?
+	    @Binding var searchQuery: String
+	    @Binding var statusFilter: PaperStatusFilter
+	    @Binding var sort: PaperSort
+	    @Binding var selectedTradingTags: Set<String>
+	    @Binding var selectedAssetClasses: Set<String>
+	    @Binding var selectedHorizons: Set<String>
+	    @Binding var colorBy: PaperColorBy
+	    var onSelectPaper: ((Paper) -> Void)?
+	    var onSelectSubtopic: ((Cluster) -> Void)?
+
+    private var metricsByID: [UUID: AnalyticsSummary.PaperMetric] {
+        Dictionary(uniqueKeysWithValues: (model.analyticsSummary?.paperMetrics ?? []).map { ($0.paperID, $0) })
+    }
+
+	    private var recommendationRankByID: [UUID: Int] {
+	        guard let recs = model.analyticsSummary?.recommendations, !recs.isEmpty else { return [:] }
+	        return Dictionary(uniqueKeysWithValues: recs.enumerated().map { ($0.element, $0.offset) })
+	    }
+
+	    private var hasAnyTradingFilter: Bool {
+	        !selectedTradingTags.isEmpty || !selectedAssetClasses.isEmpty || !selectedHorizons.isEmpty
+	    }
+
+	    private func tradingTags(for paper: Paper) -> Set<String> {
+	        let tags = paper.tradingLens?.tradingTags ?? []
+	        return Set(tags.isEmpty ? ["Unknown"] : tags)
+	    }
+
+	    private func assetClasses(for paper: Paper) -> Set<String> {
+	        let assets = paper.tradingLens?.assetClasses ?? []
+	        return Set(assets.isEmpty ? ["Unknown"] : assets)
+	    }
+
+	    private func horizons(for paper: Paper) -> Set<String> {
+	        let horizons = paper.tradingLens?.horizons ?? []
+	        return Set(horizons.isEmpty ? ["Unknown"] : horizons)
+	    }
+
+	    private func matches(selected: Set<String>, values: Set<String>) -> Bool {
+	        guard !selected.isEmpty else { return true }
+	        return !values.isDisjoint(with: selected)
+	    }
+
+	    private func primaryValue(from values: Set<String>) -> String {
+	        if values.count == 1, let only = values.first { return only }
+	        if let preferred = values.first(where: { $0.lowercased() != "unknown" }) { return preferred }
+	        return values.first ?? "Unknown"
+	    }
+
+	    private func tint(for paper: Paper) -> Color? {
+	        switch colorBy {
+	        case .novelty:
+	            return nil
+	        case .tradingTag:
+	            return MapPalette.categoricalTint(for: primaryValue(from: tradingTags(for: paper)))
+	        case .assetClass:
+	            return MapPalette.categoricalTint(for: primaryValue(from: assetClasses(for: paper)))
+	        case .horizon:
+	            return MapPalette.categoricalTint(for: primaryValue(from: horizons(for: paper)))
+	        }
+	    }
+
+	    private var tintByID: [UUID: Color] {
+	        guard colorBy != .novelty else { return [:] }
+	        var map: [UUID: Color] = [:]
+	        for paper in filteredPapers {
+	            if let tint = tint(for: paper) {
+	                map[paper.id] = tint
+	            }
+	        }
+	        return map
+	    }
+
+	    private var availableTradingTags: [String] {
+	        uniqueOptions(from: papers) { Array(tradingTags(for: $0)) }
+	    }
+
+	    private var availableAssetClasses: [String] {
+	        uniqueOptions(from: papers) { Array(assetClasses(for: $0)) }
+	    }
+
+	    private var availableHorizons: [String] {
+	        uniqueOptions(from: papers) { Array(horizons(for: $0)) }
+	    }
+
+	    private func uniqueOptions(from papers: [Paper], extract: (Paper) -> [String]) -> [String] {
+	        var set: Set<String> = []
+	        for paper in papers {
+	            for item in extract(paper) {
+	                let cleaned = item.trimmingCharacters(in: .whitespacesAndNewlines)
+	                if cleaned.isEmpty { continue }
+	                set.insert(cleaned)
+	            }
+	        }
+	        return set.sorted { lhs, rhs in
+	            if lhs.lowercased() == "unknown" { return false }
+	            if rhs.lowercased() == "unknown" { return true }
+	            return lhs.localizedCaseInsensitiveCompare(rhs) == .orderedAscending
+	        }
+	    }
+
+    private var filteredPapers: [Paper] {
+        let query = searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowered = query.lowercased()
+
+        var base = papers
+        if statusFilter != .all {
+            base = base.filter { statusFilter.matches($0) }
+        }
+
+	        if !lowered.isEmpty {
+	            base = base.filter { paper in
+	                if paper.title.lowercased().contains(lowered) { return true }
+	                if paper.summary.lowercased().contains(lowered) { return true }
+	                if let keywords = paper.keywords, keywords.joined(separator: " ").lowercased().contains(lowered) { return true }
+	                return false
+	            }
+	        }
+
+	        if hasAnyTradingFilter {
+	            base = base.filter { paper in
+	                matches(selected: selectedTradingTags, values: tradingTags(for: paper))
+	                    && matches(selected: selectedAssetClasses, values: assetClasses(for: paper))
+	                    && matches(selected: selectedHorizons, values: horizons(for: paper))
+	            }
+	        }
+
+	        return base.sorted(by: comparator)
+	    }
+
+	    private var comparator: (Paper, Paper) -> Bool {
+	        { lhs, rhs in
+	            let lm = metricsByID[lhs.id]
+	            let rm = metricsByID[rhs.id]
+	            let ls = lhs.tradingScores ?? lhs.tradingLens?.scores
+	            let rs = rhs.tradingScores ?? rhs.tradingLens?.scores
+	            switch sort {
+            case .recommended:
+                let lRank = recommendationRankByID[lhs.id] ?? Int.max
+                let rRank = recommendationRankByID[rhs.id] ?? Int.max
+                if lRank != rRank { return lRank < rRank }
+                fallthrough
+            case .recency:
+                let ly = lhs.year ?? -10_000
+                let ry = rhs.year ?? -10_000
+                if ly != ry { return ly > ry }
+                return lhs.title < rhs.title
+            case .title:
+                return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+            case .noveltyZ:
+                let lv = lm?.zNovelty ?? Double(highlights[lhs.id]?.novelty ?? 0)
+                let rv = rm?.zNovelty ?? Double(highlights[rhs.id]?.novelty ?? 0)
+                if lv != rv { return lv > rv }
+                let ly = lhs.year ?? -10_000
+                let ry = rhs.year ?? -10_000
+                if ly != ry { return ly > ry }
+                return lhs.title < rhs.title
+            case .consensusZ:
+                let lv = lm?.zConsensus ?? Double(highlights[lhs.id]?.saturation ?? 0)
+                let rv = rm?.zConsensus ?? Double(highlights[rhs.id]?.saturation ?? 0)
+                if lv != rv { return lv > rv }
+                let ly = lhs.year ?? -10_000
+                let ry = rhs.year ?? -10_000
+                if ly != ry { return ly > ry }
+                return lhs.title < rhs.title
+            case .influencePos:
+                let lv = lm?.influencePos ?? 0
+                let rv = rm?.influencePos ?? 0
+                if lv != rv { return lv > rv }
+                let ly = lhs.year ?? -10_000
+                let ry = rhs.year ?? -10_000
+                if ly != ry { return ly > ry }
+                return lhs.title < rhs.title
+            case .clusterConfidence:
+                let lv = lm?.clusterConfidence ?? 0
+                let rv = rm?.clusterConfidence ?? 0
+                if lv != rv { return lv > rv }
+                let ly = lhs.year ?? -10_000
+                let ry = rhs.year ?? -10_000
+                if ly != ry { return ly > ry }
+                return lhs.title < rhs.title
+            case .recombination:
+                let lv = lm?.recombination ?? 0
+                let rv = rm?.recombination ?? 0
+                if lv != rv { return lv > rv }
+                let ly = lhs.year ?? -10_000
+                let ry = rhs.year ?? -10_000
+                if ly != ry { return ly > ry }
+                return lhs.title < rhs.title
+            case .rigor:
+                let lv = lm?.rigorProxy ?? 0
+                let rv = rm?.rigorProxy ?? 0
+                if lv != rv { return lv > rv }
+                let ly = lhs.year ?? -10_000
+                let ry = rhs.year ?? -10_000
+                if ly != ry { return ly > ry }
+                return lhs.title < rhs.title
+	            case .openness:
+	                let lv = lm?.opennessScore ?? 0
+	                let rv = rm?.opennessScore ?? 0
+	                if lv != rv { return lv > rv }
+	                let ly = lhs.year ?? -10_000
+	                let ry = rhs.year ?? -10_000
+	                if ly != ry { return ly > ry }
+	                return lhs.title < rhs.title
+	            case .tradingPriority:
+	                let lv = (ls?.strategyImpact ?? 0) * (ls?.usability ?? 0) * (ls?.confidence ?? 0)
+	                let rv = (rs?.strategyImpact ?? 0) * (rs?.usability ?? 0) * (rs?.confidence ?? 0)
+	                if lv != rv { return lv > rv }
+	                let ly = lhs.year ?? -10_000
+	                let ry = rhs.year ?? -10_000
+	                if ly != ry { return ly > ry }
+	                return lhs.title < rhs.title
+	            case .tradingImpact:
+	                let lv = ls?.strategyImpact ?? 0
+	                let rv = rs?.strategyImpact ?? 0
+	                if lv != rv { return lv > rv }
+	                let ly = lhs.year ?? -10_000
+	                let ry = rhs.year ?? -10_000
+	                if ly != ry { return ly > ry }
+	                return lhs.title < rhs.title
+	            case .tradingUsability:
+	                let lv = ls?.usability ?? 0
+	                let rv = rs?.usability ?? 0
+	                if lv != rv { return lv > rv }
+	                let ly = lhs.year ?? -10_000
+	                let ry = rhs.year ?? -10_000
+	                if ly != ry { return ly > ry }
+	                return lhs.title < rhs.title
+	            case .tradingNovelty:
+	                let lv = ls?.novelty ?? 0
+	                let rv = rs?.novelty ?? 0
+	                if lv != rv { return lv > rv }
+	                let ly = lhs.year ?? -10_000
+	                let ry = rhs.year ?? -10_000
+	                if ly != ry { return ly > ry }
+	                return lhs.title < rhs.title
+	            }
+	        }
+	    }
+
+    private var emptyMessage: String {
+        if cluster == nil {
+            return "Select a subtopic to see its papers."
+        }
+        if papers.isEmpty {
+            return "No papers in this subtopic (after filters)."
+        }
+        if filteredPapers.isEmpty {
+            return "No papers match your filters."
+        }
+        return "Select a paper to see details."
+    }
+
+    var body: some View {
+        HStack(spacing: 16) {
+	            GlassPanel {
+	                PaperScatterView(
+	                    papers: filteredPapers,
+	                    highlights: highlights,
+	                    tintByPaperID: tintByID,
+	                    driftVector: driftVector,
+	                    emptyMessage: emptyMessage,
+	                    onSelectPaper: onSelectPaper
+	                )
+                .frame(minHeight: 360)
+            }
+
+            GlassPanel {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("Papers")
+                            .font(.headline)
+                            .foregroundStyle(.white)
+                        Spacer()
+                        if let cluster {
+                            Circle()
+                                .fill(MapPalette.nodeGradient(for: cluster.id))
+                                .frame(width: 14, height: 14)
+                                .shadow(color: .white.opacity(0.45), radius: 6)
+                        }
+                    }
+
+                    if let cluster {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(cluster.name)
+                                .font(.subheadline.bold())
+                                .foregroundStyle(.white)
+                            if !cluster.metaSummary.isEmpty {
+                                Text(cluster.metaSummary)
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.78))
+                                    .lineLimit(3)
+                            }
+                            if let lens = cluster.tradingLens, !lens.isEmpty {
+                                Text(lens)
+                                    .font(.caption2)
+                                    .foregroundStyle(.white.opacity(0.72))
+                                    .lineLimit(4)
+                            }
+                        }
+                    } else {
+                        Text("Pick a subtopic to explore its papers.")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.72))
+                    }
+
+                    HStack(spacing: 10) {
+                        Menu {
+                            if subtopics.isEmpty {
+                                Text("No subtopics yet.")
+                            } else {
+                                ForEach(subtopics) { sub in
+                                    Button(sub.name) { onSelectSubtopic?(sub) }
+                                }
+                            }
+                        } label: {
+                            Label(cluster?.name ?? "Choose subtopic", systemImage: "circle.grid.3x3")
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(Color.white.opacity(0.12))
+
+                        Spacer()
+
+	                        if !searchQuery.isEmpty || statusFilter != .all || sort != .recommended || hasAnyTradingFilter || colorBy != .novelty {
+	                            Button("Reset") {
+	                                searchQuery = ""
+	                                statusFilter = .all
+	                                sort = .recommended
+	                                selectedTradingTags = []
+	                                selectedAssetClasses = []
+	                                selectedHorizons = []
+	                                colorBy = .novelty
+	                            }
+	                            .buttonStyle(.bordered)
+	                            .tint(Color.white.opacity(0.12))
+	                        }
+                    }
+
+                    SearchField(text: $searchQuery, placeholder: "Search title, keywords, summary")
+
+                    Picker("Status", selection: $statusFilter) {
+                        ForEach(PaperStatusFilter.allCases) { filter in
+                            Text(filter.label).tag(filter)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+	                    HStack {
+	                        Text("\(filteredPapers.count) of \(papers.count) papers")
+	                            .font(.caption)
+	                            .foregroundStyle(.white.opacity(0.75))
+	                        Spacer()
+	                        Picker("Color", selection: $colorBy) {
+	                            ForEach(PaperColorBy.allCases) { option in
+	                                Text(option.label).tag(option)
+	                            }
+	                        }
+	                        .pickerStyle(.menu)
+	                        Picker("Sort", selection: $sort) {
+	                            ForEach(PaperSort.allCases) { option in
+	                                Text(option.label).tag(option)
+	                            }
+	                        }
+	                        .pickerStyle(.menu)
+	                    }
+
+	                    HStack(spacing: 10) {
+	                        MultiSelectMenu(
+	                            title: "Tags",
+	                            emptyLabel: "Any tag",
+	                            options: availableTradingTags,
+	                            selection: $selectedTradingTags
+	                        )
+	                        MultiSelectMenu(
+	                            title: "Assets",
+	                            emptyLabel: "Any asset",
+	                            options: availableAssetClasses,
+	                            selection: $selectedAssetClasses
+	                        )
+	                        MultiSelectMenu(
+	                            title: "Horizon",
+	                            emptyLabel: "Any horizon",
+	                            options: availableHorizons,
+	                            selection: $selectedHorizons
+	                        )
+	                        Spacer()
+	                    }
+	                    .font(.caption)
+
+	                    Divider().overlay(Color.white.opacity(0.12))
+
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 10) {
+                            if filteredPapers.isEmpty {
+                                Text(emptyMessage)
+                                    .font(.caption)
+                                    .foregroundStyle(.white.opacity(0.7))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .padding(.top, 6)
+                            } else {
+                                ForEach(filteredPapers) { paper in
+                                    Button {
+                                        onSelectPaper?(paper)
+	                                    } label: {
+	                                        PaperRowCard(
+	                                            paper: paper,
+	                                            accentTint: tintByID[paper.id],
+	                                            metric: metricsByID[paper.id],
+	                                            highlight: highlights[paper.id],
+	                                            recommendationRank: recommendationRankByID[paper.id]
+	                                        )
+	                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+            .frame(width: 390)
+        }
+    }
+}
+
+@available(macOS 26, iOS 26, *)
+private struct MultiSelectMenu: View {
+    let title: String
+    let emptyLabel: String
+    let options: [String]
+    @Binding var selection: Set<String>
+
+    private var labelText: String {
+        selection.isEmpty ? emptyLabel : "\(title) (\(selection.count))"
+    }
+
+    var body: some View {
+        Menu {
+            if selection.isEmpty == false {
+                Button("Clear") { selection.removeAll() }
+                Divider()
+            }
+            if options.isEmpty {
+                Text("No data")
+            } else {
+                ForEach(options, id: \.self) { option in
+                    Button {
+                        if selection.contains(option) {
+                            selection.remove(option)
+                        } else {
+                            selection.insert(option)
+                        }
+                    } label: {
+                        HStack {
+                            Text(option)
+                            Spacer()
+                            if selection.contains(option) {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            }
+        } label: {
+            Text(labelText)
+        }
+        .buttonStyle(.bordered)
+        .tint(Color.white.opacity(0.12))
+        .disabled(options.isEmpty)
+    }
+}
+
+@available(macOS 26, iOS 26, *)
+private struct SearchField: View {
+    @Binding var text: String
+    let placeholder: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.white.opacity(0.65))
+            TextField(placeholder, text: $text)
+                .textFieldStyle(.plain)
+                .foregroundStyle(.white)
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.white.opacity(0.65))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+}
+
+@available(macOS 26, iOS 26, *)
+private struct PaperRowCard: View {
+    let paper: Paper
+    let accentTint: Color?
+    let metric: AnalyticsSummary.PaperMetric?
+    let highlight: PaperNoveltyScore?
+    let recommendationRank: Int?
+
+    private func zText(_ value: Double) -> String {
+        String(format: "%+.2f", value)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                if let accentTint {
+                    Circle()
+                        .fill(accentTint)
+                        .frame(width: 10, height: 10)
+                        .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 1))
+                        .padding(.top, 4)
+                }
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(paper.title)
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white)
+                        .lineLimit(2)
+
+                    Text(paper.summary)
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.78))
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 0)
+
+                if recommendationRank != nil {
+                    Image(systemName: "star.fill")
+                        .font(.caption.bold())
+                        .foregroundStyle(Color.yellow.opacity(0.9))
+                        .padding(.top, 2)
+                }
+            }
+
+            HStack(spacing: 6) {
+                if let year = paper.year {
+                    MiniPill(label: "\(year)", tint: Color.white.opacity(0.10))
+                }
+
+                if let status = paper.readingStatus {
+                    MiniPill(
+                        label: status.label,
+                        tint: status == .done ? Color.green.opacity(0.22) : Color.white.opacity(0.10)
+                    )
+                }
+
+                if let m = metric {
+                    MiniPill(label: "N z \(zText(m.zNovelty))", tint: Color.pink.opacity(0.20))
+                    MiniPill(label: "C z \(zText(m.zConsensus))", tint: Color.mint.opacity(0.18))
+
+                    if let conf = m.clusterConfidence, conf < 0.65 {
+                        MiniPill(label: "Boundary", tint: Color.yellow.opacity(0.20))
+                    }
+
+                    if m.hasCodeLink == true {
+                        Image(systemName: "chevron.left.forwardslash.chevron.right")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.white.opacity(0.72))
+                    }
+                    if m.hasDataLink == true {
+                        Image(systemName: "externaldrive")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.white.opacity(0.72))
+                    }
+                    if m.duplicateGroup != nil {
+                        Image(systemName: "doc.on.doc")
+                            .font(.caption2.bold())
+                            .foregroundStyle(.white.opacity(0.62))
+                    }
+                    if let flags = m.ingestionFlags, !flags.isEmpty {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2.bold())
+                            .foregroundStyle(Color.orange.opacity(0.85))
+                    }
+                } else if let h = highlight {
+                    if h.novelty > 0.6 {
+                        MiniPill(label: "Outlier", tint: Color.purple.opacity(0.22))
+                    }
+                    if h.saturation > 0.6 {
+                        MiniPill(label: "Dense", tint: Color.orange.opacity(0.22))
+                    }
+                }
+
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+}
+
+@available(macOS 26, iOS 26, *)
+private struct MiniPill: View {
+    let label: String
+    let tint: Color
+
+    var body: some View {
+        Text(label)
+            .font(.caption2.bold())
+            .foregroundStyle(.white.opacity(0.85))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(tint, in: Capsule())
     }
 }
 
@@ -1285,7 +2076,9 @@ struct ClusterDetailCard: View {
 struct PaperScatterView: View {
     let papers: [Paper]
     let highlights: [UUID: PaperNoveltyScore]
+    let tintByPaperID: [UUID: Color]
     let driftVector: (dx: Double, dy: Double)?
+    let emptyMessage: String
     var onSelectPaper: ((Paper) -> Void)?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expandedPaperID: UUID?
@@ -1320,7 +2113,7 @@ struct PaperScatterView: View {
                     .shadow(color: .black.opacity(0.25), radius: 16, x: 0, y: 10)
 
                 if papers.isEmpty {
-                    Text("Select a subtopic to see its papers.")
+                    Text(emptyMessage)
                         .foregroundStyle(.white.opacity(0.7))
                 } else {
                     Color.clear
@@ -1347,16 +2140,16 @@ struct PaperScatterView: View {
                         }
 
                         if usesDotMode {
-                            ForEach(Array(papers.enumerated()), id: \.1.id) { idx, paper in
-                                let pos = resolvedPositions[idx]
-                                let score = highlights[paper.id]
-                                let isSelected = expandedPaperID == paper.id
-                                PaperDotView(highlight: score, isSelected: isSelected)
-                                    .position(pos)
-                                    .contentShape(Circle())
-                                    .onTapGesture {
-                                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
-                                            expandedPaperID = isSelected ? nil : paper.id
+	                            ForEach(Array(papers.enumerated()), id: \.1.id) { idx, paper in
+	                                let pos = resolvedPositions[idx]
+	                                let score = highlights[paper.id]
+	                                let isSelected = expandedPaperID == paper.id
+	                                PaperDotView(highlight: score, isSelected: isSelected, overrideTint: tintByPaperID[paper.id])
+	                                    .position(pos)
+	                                    .contentShape(Circle())
+	                                    .onTapGesture {
+	                                        withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
+	                                            expandedPaperID = isSelected ? nil : paper.id
                                         }
                                     }
                             }
@@ -1365,12 +2158,13 @@ struct PaperScatterView: View {
                                let idx = papers.firstIndex(where: { $0.id == selectedID }) {
                                 let paper = papers[idx]
                                 let pos = resolvedPositions[idx]
-                                PaperNodeView(
-                                    paper: paper,
-                                    highlight: highlights[paper.id],
-                                    isExpanded: true,
-                                    onOpen: { onSelectPaper?(paper) }
-                                )
+	                                PaperNodeView(
+	                                    paper: paper,
+	                                    highlight: highlights[paper.id],
+	                                    isExpanded: true,
+	                                    accentTint: tintByPaperID[paper.id],
+	                                    onOpen: { onSelectPaper?(paper) }
+	                                )
                                 .position(pos)
                                 .zIndex(10)
                                 .transition(.opacity.combined(with: .scale(scale: 0.98)))
@@ -1380,12 +2174,13 @@ struct PaperScatterView: View {
                                 let pos = resolvedPositions[idx]
                                 let score = highlights[paper.id]
                                 let isExpanded = expandedPaperID == paper.id
-                                PaperNodeView(
-                                    paper: paper,
-                                    highlight: score,
-                                    isExpanded: isExpanded,
-                                    onOpen: { onSelectPaper?(paper) }
-                                )
+	                                PaperNodeView(
+	                                    paper: paper,
+	                                    highlight: score,
+	                                    isExpanded: isExpanded,
+	                                    accentTint: tintByPaperID[paper.id],
+	                                    onOpen: { onSelectPaper?(paper) }
+	                                )
                                 .position(pos)
                                 .zIndex(isExpanded ? 10 : 0)
                                 .onTapGesture {
@@ -1515,8 +2310,10 @@ struct PaperScatterView: View {
 private struct PaperDotView: View {
     let highlight: PaperNoveltyScore?
     let isSelected: Bool
+    let overrideTint: Color?
 
     private var tint: Color {
+        if let overrideTint { return overrideTint }
         guard let highlight else { return Color.white.opacity(0.55) }
         if highlight.novelty > 0.6 { return Color.purple.opacity(0.85) }
         if highlight.saturation > 0.6 { return Color.orange.opacity(0.85) }
@@ -1544,6 +2341,7 @@ struct PaperNodeView: View {
     let paper: Paper
     let highlight: PaperNoveltyScore?
     let isExpanded: Bool
+    let accentTint: Color?
     var onOpen: (() -> Void)?
 
     @State private var isHovering: Bool = false
@@ -1560,11 +2358,18 @@ struct PaperNodeView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 8) {
-                Text(paper.title)
-                    .font(.subheadline.bold())
-                    .foregroundStyle(.white)
+	        VStack(alignment: .leading, spacing: 8) {
+	            HStack(alignment: .top, spacing: 8) {
+	                if let accentTint {
+	                    Circle()
+	                        .fill(accentTint)
+	                        .frame(width: 10, height: 10)
+	                        .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 1))
+	                        .padding(.top, 4)
+	                }
+	                Text(paper.title)
+	                    .font(.subheadline.bold())
+	                    .foregroundStyle(.white)
                     .lineLimit(isExpanded ? 3 : 2)
                 Spacer(minLength: 0)
                 Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
@@ -1909,9 +2714,9 @@ struct PaperNodeView: View {
         let prompt = PromptStore.render(template: template, variables: [
             "title": latestPaper.title,
             "keywords": keywords,
-            "summary": latestPaper.summary,
+            "summary": LLMText.clip(latestPaper.summary, maxChars: 2400),
             "takeaways": takeaways.isEmpty ? "(none provided)" : "• \(takeaways)",
-            "question": question
+            "question": LLMText.clip(question, maxChars: 700)
         ])
 
         do {

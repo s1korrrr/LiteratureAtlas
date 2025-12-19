@@ -21,6 +21,7 @@ import math
 import pathlib
 import re
 import difflib
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import List, Dict, Any
 
@@ -103,11 +104,24 @@ class PaperRow:
     method_pipeline: dict[str, Any] | None
     assumptions: list[str] | None
     page_count: int | None
+    trading_tags: list[str] | None
+    asset_classes: list[str] | None
+    horizons: list[str] | None
+    signal_archetypes: list[str] | None
+    trading_novelty: float | None
+    trading_usability: float | None
+    trading_strategy_impact: float | None
+    trading_confidence: float | None
+    trading_priority: float | None
+    one_line_verdict: str | None
+    has_strategy_blueprint: bool | None
+    has_backtest_audit: bool | None
 
 
-def load_papers(papers_dir: pathlib.Path) -> tuple[list[PaperRow], list[list[float]]]:
+def load_papers(papers_dir: pathlib.Path) -> tuple[list[PaperRow], list[list[float]], list[dict[str, Any]]]:
     rows: list[PaperRow] = []
     embeddings: list[list[float]] = []
+    trading_rows: list[dict[str, Any]] = []
     for path in sorted(papers_dir.glob("*.paper.json")):
         data = json.loads(path.read_text())
         emb = data.get("embedding") or []
@@ -115,6 +129,55 @@ def load_papers(papers_dir: pathlib.Path) -> tuple[list[PaperRow], list[list[flo
             continue
         year = data.get("year")
         cluster_id = data.get("clusterIndex")
+
+        tl = data.get("trading_lens") or {}
+        if not isinstance(tl, dict):
+            tl = {}
+        scores = data.get("scores") or tl.get("scores") or {}
+        if not isinstance(scores, dict):
+            scores = {}
+
+        trading_tags = tl.get("trading_tags") or []
+        asset_classes = tl.get("asset_classes") or []
+        horizons = tl.get("horizons") or []
+        signal_archetypes = tl.get("signal_archetypes") or []
+        risk_flags = tl.get("risk_flags") or []
+
+        if not isinstance(trading_tags, list):
+            trading_tags = []
+        if not isinstance(asset_classes, list):
+            asset_classes = []
+        if not isinstance(horizons, list):
+            horizons = []
+        if not isinstance(signal_archetypes, list):
+            signal_archetypes = []
+        if not isinstance(risk_flags, list):
+            risk_flags = []
+
+        novelty = scores.get("novelty")
+        usability = scores.get("usability")
+        strategy_impact = scores.get("strategy_impact")
+        confidence = scores.get("confidence")
+
+        def _f(x):
+            try:
+                return float(x)
+            except Exception:
+                return None
+
+        novelty_f = _f(novelty)
+        usability_f = _f(usability)
+        impact_f = _f(strategy_impact)
+        conf_f = _f(confidence)
+        priority_f = (impact_f or 0.0) * (usability_f or 0.0) * (conf_f or 0.0)
+
+        one_line_verdict = tl.get("one_line_verdict")
+        if not isinstance(one_line_verdict, str):
+            one_line_verdict = None
+
+        has_blueprint = bool(data.get("strategy_blueprint"))
+        has_audit = bool(data.get("backtest_audit"))
+
         # Future multi-scale fields
         primary_k10 = data.get("primary_cluster_k10") or cluster_id
         primary_k50 = data.get("primary_cluster_k50")
@@ -140,10 +203,43 @@ def load_papers(papers_dir: pathlib.Path) -> tuple[list[PaperRow], list[list[flo
                 method_pipeline=data.get("methodPipeline"),
                 assumptions=data.get("assumptions"),
                 page_count=data.get("pageCount"),
+                trading_tags=trading_tags,
+                asset_classes=asset_classes,
+                horizons=horizons,
+                signal_archetypes=signal_archetypes,
+                trading_novelty=novelty_f,
+                trading_usability=usability_f,
+                trading_strategy_impact=impact_f,
+                trading_confidence=conf_f,
+                trading_priority=priority_f,
+                one_line_verdict=one_line_verdict,
+                has_strategy_blueprint=has_blueprint,
+                has_backtest_audit=has_audit,
             )
         )
         embeddings.append(emb)
-    return rows, embeddings
+
+        trading_rows.append(
+            {
+                "paper_id": data["id"],
+                "year": year,
+                "cluster_id": cluster_id,
+                "trading_tags": trading_tags,
+                "asset_classes": asset_classes,
+                "horizons": horizons,
+                "signal_archetypes": signal_archetypes,
+                "risk_flags": risk_flags,
+                "novelty": novelty_f,
+                "usability": usability_f,
+                "strategy_impact": impact_f,
+                "confidence": conf_f,
+                "priority": priority_f,
+                "one_line_verdict": one_line_verdict,
+                "has_strategy_blueprint": has_blueprint,
+                "has_backtest_audit": has_audit,
+            }
+        )
+    return rows, embeddings, trading_rows
 
 
 def load_chunks(chunks_path: pathlib.Path) -> list[dict[str, Any]]:
@@ -249,6 +345,133 @@ def tag_text_for_row(row: PaperRow) -> str:
                 if isinstance(label, str):
                     tokens.append(label)
     return " ".join(tokens)
+
+
+def summarize_trading_lens(trading_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not trading_rows:
+        return {"available": False, "reason": "No trading lens rows loaded."}
+
+    def has_lens(row: dict[str, Any]) -> bool:
+        if not isinstance(row, dict):
+            return False
+        for key in ("trading_tags", "asset_classes", "horizons", "signal_archetypes", "risk_flags"):
+            vals = row.get(key)
+            if isinstance(vals, list) and any(isinstance(v, str) and v.strip() for v in vals):
+                return True
+        for key in ("novelty", "usability", "strategy_impact", "confidence"):
+            if row.get(key) is not None:
+                return True
+        if isinstance(row.get("one_line_verdict"), str) and row.get("one_line_verdict").strip():
+            return True
+        if bool(row.get("has_strategy_blueprint")) or bool(row.get("has_backtest_audit")):
+            return True
+        return False
+
+    def _norm_list(values: Any) -> list[str]:
+        if not isinstance(values, list):
+            return []
+        out: list[str] = []
+        for v in values:
+            if isinstance(v, str):
+                s = v.strip()
+                if s:
+                    out.append(s)
+        return out
+
+    tag_counts: Counter[str] = Counter()
+    asset_counts: Counter[str] = Counter()
+    horizon_counts: Counter[str] = Counter()
+    risk_counts: Counter[str] = Counter()
+    tag_year_counts: dict[str, Counter[int]] = defaultdict(Counter)
+
+    score_points: list[dict[str, Any]] = []
+    lens_rows = [r for r in trading_rows if has_lens(r)]
+    for row in lens_rows:
+        tags = _norm_list(row.get("trading_tags"))
+        assets = _norm_list(row.get("asset_classes"))
+        horizons = _norm_list(row.get("horizons"))
+        risks = _norm_list(row.get("risk_flags"))
+
+        if not tags:
+            tags = ["Unknown"]
+        if not assets:
+            assets = ["UNKNOWN"]
+        if not horizons:
+            horizons = ["UNKNOWN"]
+
+        for t in sorted(set(tags)):
+            tag_counts[t] += 1
+        for a in sorted(set(assets)):
+            asset_counts[a] += 1
+        for h in sorted(set(horizons)):
+            horizon_counts[h] += 1
+        for rf in sorted(set(risks)):
+            risk_counts[rf] += 1
+
+        year = row.get("year")
+        if year is not None:
+            try:
+                y = int(year)
+            except Exception:
+                y = None
+            if y is not None:
+                for t in sorted(set(tags)):
+                    tag_year_counts[t][y] += 1
+
+        novelty = row.get("novelty")
+        usability = row.get("usability")
+        if novelty is not None and usability is not None:
+            score_points.append(
+                {
+                    "paper_id": row.get("paper_id"),
+                    "year": row.get("year"),
+                    "cluster_id": row.get("cluster_id"),
+                    "novelty": novelty,
+                    "usability": usability,
+                    "strategy_impact": row.get("strategy_impact"),
+                    "confidence": row.get("confidence"),
+                    "priority": row.get("priority"),
+                    "primary_tag": tags[0] if tags else "Unknown",
+                    "primary_asset_class": assets[0] if assets else "UNKNOWN",
+                    "primary_horizon": horizons[0] if horizons else "UNKNOWN",
+                    "one_line_verdict": row.get("one_line_verdict"),
+                    "has_strategy_blueprint": bool(row.get("has_strategy_blueprint")),
+                    "has_backtest_audit": bool(row.get("has_backtest_audit")),
+                }
+            )
+
+    if not lens_rows:
+        return {"available": False, "reason": "No papers include trading lens fields yet."}
+
+    def _counter_to_rows(counter: Counter[str], key: str) -> list[dict[str, Any]]:
+        return [{key: k, "count": int(v)} for k, v in counter.most_common(64)]
+
+    top_tags = [t for t, _ in tag_counts.most_common(6) if t != "Unknown"]
+    tag_trends: list[dict[str, Any]] = []
+    for tag in top_tags:
+        counts = tag_year_counts.get(tag)
+        if not counts:
+            continue
+        for year, count in sorted(counts.items()):
+            tag_trends.append({"tag": tag, "year": int(year), "count": int(count)})
+
+    score_points.sort(key=lambda r: float(r.get("priority") or 0.0), reverse=True)
+
+    return {
+        "available": True,
+        "paper_count_with_lens": int(len(lens_rows)),
+        "coverage_pct": float(len(lens_rows) / max(1, len(trading_rows))),
+        "tag_counts": _counter_to_rows(tag_counts, "tag"),
+        "asset_class_counts": _counter_to_rows(asset_counts, "asset_class"),
+        "horizon_counts": _counter_to_rows(horizon_counts, "horizon"),
+        "risk_flag_counts": _counter_to_rows(risk_counts, "risk_flag"),
+        "tag_trends": tag_trends,
+        "score_points": score_points[: min(5000, len(score_points))],
+        "top_priority": [
+            {"paper_id": r.get("paper_id"), "priority": r.get("priority"), "one_line_verdict": r.get("one_line_verdict")}
+            for r in score_points[:50]
+        ],
+    }
 
 # ---------- Embedding transforms ----------
 
@@ -1321,10 +1544,14 @@ def drift_contribution(df_papers: pd.DataFrame, Z: np.ndarray, drift_vectors: di
         pid = row.paper_id
         cid = row.cluster_id
         year = row.year
-        if cid is None or year is None:
+        if cid is None or year is None or pd.isna(cid) or pd.isna(year):
             contrib[pid] = 0.0
             continue
-        key = (int(cid), int(year))
+        try:
+            key = (int(cid), int(year))
+        except (TypeError, ValueError):
+            contrib[pid] = 0.0
+            continue
         if key not in drift_vectors or key not in cent:
             contrib[pid] = 0.0
             continue
@@ -3458,7 +3685,7 @@ def main():
         raise SystemExit(f"No papers found at {papers_dir}. Run the Swift app ingestion first.")
 
     print(f"[analytics] Loading papers from {papers_dir}")
-    paper_rows, embedding_lists = load_papers(papers_dir)
+    paper_rows, embedding_lists, trading_rows = load_papers(papers_dir)
     if not paper_rows:
         raise SystemExit("No papers with embeddings to load.")
 
@@ -3728,6 +3955,27 @@ def main():
 
     # Persist DuckDB after computing extra tables (optional)
     extra_tables: dict[str, pd.DataFrame] = {}
+    trading_section = summarize_trading_lens(trading_rows)
+    if trading_section.get("available"):
+        extra_tables["paper_trading_lens"] = pd.DataFrame(trading_rows)
+
+        def _explode(key: str, col: str) -> pd.DataFrame:
+            flat: list[dict[str, Any]] = []
+            for r in trading_rows:
+                pid = r.get("paper_id")
+                vals = r.get(key) or []
+                if not isinstance(vals, list):
+                    continue
+                for v in vals:
+                    if isinstance(v, str) and v.strip():
+                        flat.append({"paper_id": pid, col: v.strip()})
+            return pd.DataFrame(flat)
+
+        extra_tables["paper_trading_tags"] = _explode("trading_tags", "tag")
+        extra_tables["paper_trading_asset_classes"] = _explode("asset_classes", "asset_class")
+        extra_tables["paper_trading_horizons"] = _explode("horizons", "horizon")
+        extra_tables["paper_trading_signal_archetypes"] = _explode("signal_archetypes", "signal_archetype")
+        extra_tables["paper_trading_risk_flags"] = _explode("risk_flags", "risk_flag")
     if refs_rows:
         extra_tables["refs"] = pd.DataFrame(refs_rows)
     if in_corpus_cites:
@@ -3863,6 +4111,7 @@ def main():
         },
         "claims": claims_section,
         "methods": methods_section,
+        "trading": trading_section,
         "workflow": {
             "coverage": workflow,
             "qa_gaps": qa_gaps,

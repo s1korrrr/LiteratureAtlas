@@ -43,6 +43,7 @@ struct AnalyticsView: View {
     @State private var customCutoffs: String = "2010 2015 2020"
     @State private var selectedPaperDetail: Paper?
     @State private var selectedNoveltyPointID: UUID?
+    @State private var selectedTradingPointID: UUID?
     @State private var noveltyMode: NoveltyMode = .geometric
     @State private var selectedClusterFilter: Int?
     @State private var showFrontier: Bool = true
@@ -522,6 +523,48 @@ struct AnalyticsView: View {
         return model.papers.first(where: { $0.id == id })
     }
 
+    private var tradingLensPoints: [TradingLensPoint] {
+        guard let trading = analyticsSummary?.trading,
+              trading.available == true,
+              let points = trading.scorePoints,
+              !points.isEmpty else { return [] }
+
+        let titleMap = Dictionary(uniqueKeysWithValues: model.papers.map { ($0.id, $0.title) })
+        let yearMap = Dictionary(uniqueKeysWithValues: model.papers.compactMap { paper in
+            paper.year.map { (paper.id, $0) }
+        })
+        let yearRange = effectiveYearRange
+
+        return points.compactMap { pt in
+            if let yearRange {
+                guard let y = pt.year ?? yearMap[pt.paperID], yearRange.contains(y) else { return nil }
+            }
+            guard let title = titleMap[pt.paperID] else { return nil }
+            return TradingLensPoint(
+                id: pt.paperID,
+                novelty: pt.novelty,
+                usability: pt.usability,
+                strategyImpact: pt.strategyImpact ?? 0,
+                confidence: pt.confidence ?? 0.0,
+                priority: pt.priority ?? 0.0,
+                title: title,
+                primaryTag: pt.primaryTag,
+                primaryAssetClass: pt.primaryAssetClass,
+                primaryHorizon: pt.primaryHorizon
+            )
+        }
+    }
+
+    private var selectedTradingPoint: TradingLensPoint? {
+        guard let id = selectedTradingPointID else { return nil }
+        return tradingLensPoints.first(where: { $0.id == id })
+    }
+
+    private var selectedTradingPaperCandidate: Paper? {
+        guard let id = selectedTradingPointID else { return nil }
+        return model.papers.first(where: { $0.id == id })
+    }
+
     private var driftVolatilityStats: [AnalyticsSummary.DriftVolatility] {
         analyticsSummary?.driftVolatility ?? []
     }
@@ -693,6 +736,129 @@ struct AnalyticsView: View {
         }
     }
 
+    private func tradingLensCard(_ summary: AnalyticsSummary) -> some View {
+        Group {
+            if let trading = summary.trading {
+                GlassCard {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(alignment: .firstTextBaseline) {
+                            Text("Trading lens").font(.headline)
+                            Spacer()
+                            if let count = trading.paperCountWithLens {
+                                let pct = trading.coveragePct ?? (Double(count) / Double(max(1, summary.paperCount)))
+                                Text(String(format: "Coverage %d / %d (%.0f%%)", count, summary.paperCount, pct * 100))
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+
+                        if trading.available != true {
+                            Text(trading.reason ?? "Generate paper trading lens scorecards to populate this section.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            if !tradingLensPoints.isEmpty {
+                                TradingLensScatterChartView(points: tradingLensPoints, selectedPointID: $selectedTradingPointID)
+                                    .frame(height: chartHeight(analyticsContentWidth, ratio: 0.46, min: 420, max: 760))
+                                Text("x=usability · y=novelty · color=strategy impact · opacity=confidence")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text("No scored papers in the current filter.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            if let pt = selectedTradingPoint {
+                                HStack(alignment: .top, spacing: 10) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(pt.title)
+                                            .font(.caption.bold())
+                                        Text(String(format: "Novelty %.1f · Usability %.1f · Impact %.1f · Priority %.1f", pt.novelty, pt.usability, pt.strategyImpact, pt.priority))
+                                            .font(.caption2)
+                                            .foregroundStyle(.secondary)
+                                        if let tag = pt.primaryTag, tag != "Unknown" {
+                                            Text("Tag: \(tag)")
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer()
+                                    if let paper = selectedTradingPaperCandidate {
+                                        Button {
+                                            selectedPaperDetail = paper
+                                        } label: {
+                                            Label("Open details", systemImage: "doc.text.magnifyingglass")
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                    }
+                                    Button {
+                                        selectedTradingPointID = nil
+                                    } label: {
+                                        Label("Clear", systemImage: "xmark")
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+
+                            if let tagCounts = trading.tagCounts, !tagCounts.isEmpty {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("Top trading tags").font(.subheadline.weight(.semibold))
+                                    TradingTagBarChartView(
+                                        counts: tagCounts.prefix(14).map { TradingTagCount(tag: $0.tag, count: $0.count) }
+                                    )
+                                        .frame(height: chartHeight(analyticsContentWidth, ratio: 0.3, min: 300, max: 480))
+                                }
+                            }
+
+                            if let trends = trading.tagTrends, !trends.isEmpty {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("Tag frequency over time").font(.subheadline.weight(.semibold))
+                                    TradingTagTrendChartView(
+                                        trends: trends.map { TradingTagTrendPoint(tag: $0.tag, year: $0.year, count: $0.count) },
+                                        domain: chartYearDomain ?? 1900...Calendar.current.component(.year, from: Date())
+                                    )
+                                    .frame(height: chartHeight(analyticsContentWidth, ratio: 0.28, min: 260, max: 440))
+                                }
+                            }
+
+                            if let top = trading.topPriority, !top.isEmpty {
+                                let paperMap = Dictionary(uniqueKeysWithValues: model.papers.map { ($0.id, $0) })
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("Top priority (impact×usability×confidence)").font(.subheadline.weight(.semibold))
+                                    ForEach(Array(top.prefix(8)), id: \.paperID) { entry in
+                                        let label = paperMap[entry.paperID]?.title ?? "Paper"
+                                        HStack(alignment: .firstTextBaseline) {
+                                            Button {
+                                                if let paper = paperMap[entry.paperID] {
+                                                    selectedPaperDetail = paper
+                                                }
+                                            } label: {
+                                                Text(label)
+                                                    .font(.caption)
+                                                    .lineLimit(2)
+                                            }
+                                            .buttonStyle(.plain)
+                                            Spacer()
+                                            Text(String(format: "%.1f", entry.priority ?? 0.0))
+                                                .font(.caption2.monospacedDigit())
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        if let verdict = entry.oneLineVerdict, !verdict.isEmpty {
+                                            Text(verdict)
+                                                .font(.caption2)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     @ViewBuilder private func driftCard() -> some View {
         GlassCard {
             VStack(alignment: .leading, spacing: 8) {
@@ -758,9 +924,25 @@ struct AnalyticsView: View {
         GlassCard {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Influential ideas").font(.headline)
-                ForEach(influenceTop, id: \.paper.id) { item in
-                    Text("\(item.paper.title) — score \(String(format: "%.3f", item.score))")
-                        .font(.caption)
+                if influenceTop.isEmpty {
+                    Text("No influence results yet.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(spacing: 10) {
+                        ForEach(Array(influenceTop.enumerated()), id: \.element.paper.id) { idx, item in
+                            PaperActionRow(
+                                paper: item.paper,
+                                subtitle: item.paper.tradingLens?.oneLineVerdict?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                                    ? item.paper.tradingLens?.oneLineVerdict
+                                    : item.paper.summary,
+                                leadingBadge: "#\(idx + 1)",
+                                trailingPill: String(format: "%.3f", item.score),
+                                trailingPillTint: .teal,
+                                onOpen: { selectedPaperDetail = item.paper }
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -789,22 +971,29 @@ struct AnalyticsView: View {
         GlassCard {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Idea river (greedy storyline)").font(.headline)
-                ForEach(Array(ideaRiver.enumerated()), id: \.offset) { idx, p in
-                    HStack {
-                        Text("\(idx + 1). \(p.title)")
-                            .font(.caption)
-                            .transition(.scale.combined(with: .opacity))
-                        Spacer()
-                        if let year = p.year {
-                            Text("\(year)")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
+                if ideaRiver.isEmpty {
+                    Text("No river computed yet.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    VStack(spacing: 10) {
+                        ForEach(Array(ideaRiver.enumerated()), id: \.element.id) { idx, paper in
+                            PaperActionRow(
+                                paper: paper,
+                                subtitle: paper.tradingLens?.oneLineVerdict?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+                                    ? paper.tradingLens?.oneLineVerdict
+                                    : paper.summary,
+                                leadingBadge: "\(idx + 1)",
+                                trailingPill: paper.year.map(String.init),
+                                trailingPillTint: .mint,
+                                onOpen: { selectedPaperDetail = paper }
+                            )
+                            if idx < ideaRiver.count - 1 {
+                                Image(systemName: "arrow.down.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
-                    }
-                    if idx < ideaRiver.count - 1 {
-                        Image(systemName: "arrow.down.right")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
                     }
                 }
                 Text("Start = most influential, then follow strongest downstream edge (older → newer claims).")
@@ -1119,6 +1308,7 @@ struct AnalyticsView: View {
     @ViewBuilder
     private func summarySection(_ summary: AnalyticsSummary) -> some View {
         if !noveltyConsensus.isEmpty { noveltyCard() }
+        if summary.trading != nil { tradingLensCard(summary) }
         if !driftTop.isEmpty { driftCard() }
         if !factorExposures.isEmpty { factorCard(summary) }
         if !influenceTop.isEmpty { influenceCard() }
@@ -1167,6 +1357,180 @@ struct AnalyticsView: View {
         }
     }
 
+    @ViewBuilder private func corpusBriefingCard() -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text("Corpus briefing")
+                        .font(.headline)
+                    Spacer()
+                    Button {
+                        model.generateCorpusBriefing()
+                    } label: {
+                        if model.isGeneratingBriefing {
+                            ProgressView().controlSize(.small)
+                            Text("Synthesizing…")
+                        } else {
+                            Label(model.corpusBriefing.isEmpty ? "Generate" : "Refresh", systemImage: "wand.and.stars")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.isGeneratingBriefing || model.megaClusters.isEmpty)
+                    .contextMenu {
+                        Button("Force regenerate") {
+                            model.generateCorpusBriefing(force: true)
+                        }
+                    }
+                }
+
+                if model.megaClusters.isEmpty {
+                    Text("Run clustering to generate a topic hierarchy first.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let error = model.corpusBriefingError {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                }
+
+                if model.corpusBriefing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text("Create an executive summary of your entire corpus from the current topic hierarchy.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView {
+                        Text(model.corpusBriefing)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .textSelection(.enabled)
+                    }
+                    .frame(maxHeight: 260)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder private func backendAnalyticsCard() -> some View {
+        GlassCard {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Backend analytics (DuckDB / Python)")
+                    .font(.headline)
+                HStack {
+                    Button("Reload analytics.json") {
+                        model.reloadAnalyticsSummary()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Text("Reads Output/analytics/analytics.json")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+#if os(macOS)
+                    Spacer()
+                    Button {
+                        let cwd = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+                        let folder = cwd.appendingPathComponent("Output", isDirectory: true)
+                            .appendingPathComponent("analytics", isDirectory: true)
+                        PlatformOpen.revealInFinder(url: folder)
+                    } label: {
+                        Label("Open folder", systemImage: "folder")
+                    }
+                    .buttonStyle(.bordered)
+#endif
+                }
+#if os(macOS)
+                HStack {
+                    Button {
+                        model.rebuildAnalyticsViaPython()
+                    } label: {
+                        if model.analyticsRebuildInFlight {
+                            ProgressView().controlSize(.small)
+                            Text("Rebuilding…")
+                        } else {
+                            Label("Rebuild via Python", systemImage: "hammer.fill")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.analyticsRebuildInFlight)
+                    if let msg = model.analyticsRebuildMessage {
+                        Text(msg)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                HStack {
+                    Button {
+                        model.installAnalyticsPythonDependencies()
+                    } label: {
+                        if model.analyticsDepsInstallInFlight {
+                            ProgressView().controlSize(.small)
+                            Text("Installing…")
+                        } else {
+                            Label("Install Python deps", systemImage: "square.and.arrow.down")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(model.analyticsDepsInstallInFlight || model.analyticsRebuildInFlight)
+                    if let msg = model.analyticsDepsInstallMessage {
+                        Text(msg)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                if let output = model.analyticsDepsInstallOutput,
+                   !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    InteractiveLogPanel(
+                        title: "Last install log",
+                        text: Binding(
+                            get: { model.analyticsDepsInstallOutput ?? "" },
+                            set: { newValue in
+                                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                                model.analyticsDepsInstallOutput = trimmed.isEmpty ? nil : newValue
+                            }
+                        ),
+                        minHeight: 160
+                    )
+                }
+                if let output = model.analyticsRebuildOutput,
+                   !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    InteractiveLogPanel(
+                        title: "Last rebuild log",
+                        text: Binding(
+                            get: { model.analyticsRebuildOutput ?? "" },
+                            set: { newValue in
+                                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                                model.analyticsRebuildOutput = trimmed.isEmpty ? nil : newValue
+                            }
+                        ),
+                        minHeight: 180
+                    )
+                }
+#endif
+                if let summary = model.analyticsSummary {
+                    Text("Generated at \(formatDate(summary.generatedAt)) · \(summary.paperCount) papers · dim \(summary.vectorDim)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if let topNovel = summary.novelty.first,
+                       let paper = model.papers.first(where: { $0.id == topNovel.paperID }) {
+                        Text("Top outlier: \(paper.title)")
+                            .font(.subheadline)
+                        Text(String(format: "Novelty %.3f (cluster %@)", topNovel.novelty, topNovel.clusterID.map(String.init) ?? "n/a"))
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    if !summary.topicTrends.isEmpty {
+                        let cluster = summary.topicTrends.first?.clusterID ?? 0
+                        let years = summary.topicTrends.filter { $0.clusterID == cluster }.map { $0.year }.sorted()
+                        if let first = years.first, let last = years.last {
+                            Text("Sample trend: cluster \(cluster) covers \(first)–\(last)")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
@@ -1176,169 +1540,9 @@ struct AnalyticsView: View {
                     Text("Position (novelty/consensus) + Flow (influence/drift) across your corpus.")
                         .foregroundStyle(.secondary)
 
-                    GlassCard {
-                        VStack(alignment: .leading, spacing: 10) {
-                            HStack {
-                                Text("Corpus briefing")
-                                    .font(.headline)
-                                Spacer()
-                                Button {
-                                    model.generateCorpusBriefing()
-                                } label: {
-                                    if model.isGeneratingBriefing {
-                                        ProgressView().controlSize(.small)
-                                        Text("Synthesizing…")
-                                    } else {
-                                        Label(model.corpusBriefing.isEmpty ? "Generate" : "Refresh", systemImage: "wand.and.stars")
-                                    }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .disabled(model.isGeneratingBriefing || model.megaClusters.isEmpty)
-                                .contextMenu {
-                                    Button("Force regenerate") {
-                                        model.generateCorpusBriefing(force: true)
-                                    }
-                                }
-                            }
+                    corpusBriefingCard()
 
-                            if model.megaClusters.isEmpty {
-                                Text("Run clustering to generate a topic hierarchy first.")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            if let error = model.corpusBriefingError {
-                                Text(error)
-                                    .font(.caption2)
-                                    .foregroundStyle(.red)
-                            }
-
-                            if model.corpusBriefing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                Text("Create an executive summary of your entire corpus from the current topic hierarchy.")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                ScrollView {
-                                    Text(model.corpusBriefing)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .textSelection(.enabled)
-                                }
-                                .frame(maxHeight: 260)
-                            }
-                        }
-                    }
-
-                    GlassCard {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Backend analytics (DuckDB / Python)")
-                                .font(.headline)
-                            HStack {
-                                Button("Reload analytics.json") {
-                                    model.reloadAnalyticsSummary()
-                                }
-                                .buttonStyle(.borderedProminent)
-                                Text("Reads Output/analytics/analytics.json")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-#if os(macOS)
-                            HStack {
-                                Button {
-                                    model.rebuildAnalyticsViaPython()
-                                } label: {
-                                    if model.analyticsRebuildInFlight {
-                                        ProgressView().controlSize(.small)
-                                        Text("Rebuilding…")
-                                    } else {
-                                        Label("Rebuild via Python", systemImage: "hammer.fill")
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(model.analyticsRebuildInFlight)
-                                if let msg = model.analyticsRebuildMessage {
-                                    Text(msg)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            HStack {
-                                Button {
-                                    model.installAnalyticsPythonDependencies()
-                                } label: {
-                                    if model.analyticsDepsInstallInFlight {
-                                        ProgressView().controlSize(.small)
-                                        Text("Installing…")
-                                    } else {
-                                        Label("Install Python deps", systemImage: "square.and.arrow.down")
-                                    }
-                                }
-                                .buttonStyle(.bordered)
-                                .disabled(model.analyticsDepsInstallInFlight || model.analyticsRebuildInFlight)
-                                if let msg = model.analyticsDepsInstallMessage {
-                                    Text(msg)
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                            }
-                            if let output = model.analyticsDepsInstallOutput,
-                               !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                DisclosureGroup("Last install log") {
-                                    ScrollView {
-                                        Text(output)
-                                            .font(.caption2.monospaced())
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .textSelection(.enabled)
-                                    }
-                                    .frame(maxHeight: 140)
-                                }
-                                .font(.caption)
-                            }
-                            if let output = model.analyticsRebuildOutput,
-                               !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                DisclosureGroup("Last rebuild log") {
-                                    ScrollView {
-                                        Text(output)
-                                            .font(.caption2.monospaced())
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .textSelection(.enabled)
-                                    }
-                                    .frame(maxHeight: 160)
-                                }
-                                .font(.caption)
-                            }
-#endif
-                            if let summary = model.analyticsSummary {
-                                Text("Generated at \(formatDate(summary.generatedAt)) · \(summary.paperCount) papers · dim \(summary.vectorDim)")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                if let topNovel = summary.novelty.first,
-                                   let paper = model.papers.first(where: { $0.id == topNovel.paperID }) {
-                                    Text("Top outlier: \(paper.title)")
-                                        .font(.subheadline)
-                                    Text(String(format: "Novelty %.3f (cluster %@)", topNovel.novelty, topNovel.clusterID.map(String.init) ?? "n/a"))
-                                        .font(.caption2)
-                                        .foregroundStyle(.secondary)
-                                }
-                                if !summary.topicTrends.isEmpty {
-                                    let cluster = summary.topicTrends.first?.clusterID ?? 0
-                                    let years = summary.topicTrends.filter { $0.clusterID == cluster }.map { $0.year }.sorted()
-                                    if let first = years.first, let last = years.last {
-                                        Text("Sample trend: cluster \(cluster) covers \(first)–\(last)")
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            } else if let error = model.analyticsLoadError {
-                                Text(error)
-                                    .font(.caption2)
-                                    .foregroundStyle(.red)
-                            } else {
-                                Text("Run the Python script to populate analytics.json, then reload.")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
+                    backendAnalyticsCard()
 
                     timelineSection()
 

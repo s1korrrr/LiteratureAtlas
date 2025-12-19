@@ -13,6 +13,10 @@ struct Paper: Identifiable, Codable, Equatable {
     var resultsSummary: String?
     var takeaways: [String]?
     var keywords: [String]?
+    var tradingLens: PaperTradingLens?
+    var tradingScores: TradingLensScores?
+    var strategyBlueprint: String?
+    var backtestAudit: String?
     var userNotes: String?
     var userTags: [String]?
     var isImportant: Bool?
@@ -39,7 +43,12 @@ struct Paper: Identifiable, Codable, Equatable {
     var fileURL: URL { URL(fileURLWithPath: filePath) }
 
     enum CodingKeys: String, CodingKey {
-        case version, filePath, id, originalFilename, title, introSummary, summary, methodSummary, resultsSummary, takeaways, keywords, userNotes, userTags, isImportant, readingStatus, noteEmbedding, userQuestions, flashcards, firstReadAt, ingestedAt, pageCount, year, embedding, clusterIndex, fingerprint, status
+        case version, filePath, id, originalFilename, title, introSummary, summary, methodSummary, resultsSummary, takeaways, keywords
+        case tradingLens = "trading_lens"
+        case tradingScores = "scores"
+        case strategyBlueprint = "strategy_blueprint"
+        case backtestAudit = "backtest_audit"
+        case userNotes, userTags, isImportant, readingStatus, noteEmbedding, userQuestions, flashcards, firstReadAt, ingestedAt, pageCount, year, embedding, clusterIndex, fingerprint, status
         case claims, assumptions, evaluationContext, methodPipeline
     }
 
@@ -49,11 +58,15 @@ struct Paper: Identifiable, Codable, Equatable {
          originalFilename: String,
          title: String,
          introSummary: String?,
-        summary: String,
+         summary: String,
         methodSummary: String?,
         resultsSummary: String?,
         takeaways: [String]?,
         keywords: [String]?,
+         tradingLens: PaperTradingLens? = nil,
+         tradingScores: TradingLensScores? = nil,
+         strategyBlueprint: String? = nil,
+         backtestAudit: String? = nil,
         userNotes: String?,
         userTags: [String]?,
          isImportant: Bool? = nil,
@@ -82,6 +95,10 @@ struct Paper: Identifiable, Codable, Equatable {
         self.resultsSummary = resultsSummary
         self.takeaways = takeaways
         self.keywords = keywords
+        self.tradingLens = tradingLens
+        self.tradingScores = tradingScores ?? tradingLens?.scores
+        self.strategyBlueprint = strategyBlueprint
+        self.backtestAudit = backtestAudit
         self.userNotes = userNotes
         self.userTags = userTags
         self.isImportant = isImportant
@@ -114,6 +131,10 @@ struct Paper: Identifiable, Codable, Equatable {
         resultsSummary = try container.decodeIfPresent(String.self, forKey: .resultsSummary)
         takeaways = try container.decodeIfPresent([String].self, forKey: .takeaways)
         keywords = try container.decodeIfPresent([String].self, forKey: .keywords)
+        tradingLens = try container.decodeIfPresent(PaperTradingLens.self, forKey: .tradingLens)
+        tradingScores = try container.decodeIfPresent(TradingLensScores.self, forKey: .tradingScores) ?? tradingLens?.scores
+        strategyBlueprint = try container.decodeIfPresent(String.self, forKey: .strategyBlueprint)
+        backtestAudit = try container.decodeIfPresent(String.self, forKey: .backtestAudit)
         userNotes = try container.decodeIfPresent(String.self, forKey: .userNotes)
         userTags = try container.decodeIfPresent([String].self, forKey: .userTags)
         isImportant = try container.decodeIfPresent(Bool.self, forKey: .isImportant)
@@ -151,6 +172,10 @@ struct Paper: Identifiable, Codable, Equatable {
         try container.encodeIfPresent(resultsSummary, forKey: .resultsSummary)
         try container.encodeIfPresent(takeaways, forKey: .takeaways)
         try container.encodeIfPresent(keywords, forKey: .keywords)
+        try container.encodeIfPresent(tradingLens, forKey: .tradingLens)
+        try container.encodeIfPresent(tradingScores ?? tradingLens?.scores, forKey: .tradingScores)
+        try container.encodeIfPresent(strategyBlueprint, forKey: .strategyBlueprint)
+        try container.encodeIfPresent(backtestAudit, forKey: .backtestAudit)
         try container.encodeIfPresent(userNotes, forKey: .userNotes)
         try container.encodeIfPresent(userTags, forKey: .userTags)
         try container.encodeIfPresent(isImportant, forKey: .isImportant)

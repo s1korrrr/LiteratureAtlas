@@ -23,14 +23,7 @@ let package = Package(
             dependencies: [
                 .target(name: "AtlasFFIClib")
             ],
-            path: "Sources/LiteratureAtlas",
-            swiftSettings: [
-                .define("ATLAS_FFI_LINKED", .when(platforms: [.macOS]))
-            ],
-            linkerSettings: [
-                .unsafeFlags(["-Lanalytics/ffi/target/release"], .when(platforms: [.macOS])),
-                .linkedLibrary("atlas_ffi", .when(platforms: [.macOS]))
-            ]
+            path: "Sources/LiteratureAtlas"
         ),
         .testTarget(
             name: "LiteratureAtlasTests",

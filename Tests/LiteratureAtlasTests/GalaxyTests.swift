@@ -5,7 +5,8 @@ import XCTest
 final class GalaxyTests: XCTestCase {
 
     func testMultiScaleGalaxyAssignsClusterIndices() async {
-        let model = await MainActor.run { AppModel(skipInitialLoad: true) }
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let model = await MainActor.run { AppModel(skipInitialLoad: true, customOutputRoot: tmp) }
         let papers: [Paper] = (0..<12).map { idx in
             Paper(
                 version: 1,
@@ -39,6 +40,7 @@ final class GalaxyTests: XCTestCase {
             XCTAssertFalse(model.megaClusters.isEmpty, "Expected mega-topics")
             XCTAssertFalse(model.clusters.isEmpty, "Expected subtopics")
             XCTAssertTrue(model.papers.allSatisfy { $0.clusterIndex != nil }, "All papers should be assigned to a subtopic")
+            XCTAssertTrue(model.explorationPapers.allSatisfy { $0.clusterIndex != nil }, "Exploration cache should stay in sync after clustering")
         }
     }
 

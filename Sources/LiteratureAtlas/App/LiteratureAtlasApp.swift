@@ -32,6 +32,7 @@ final class LiteratureAtlasAppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct LiteratureAtlasApp: App {
     @StateObject private var model = AppModel()
+    @StateObject private var nav = AppNavigation()
 
     #if os(macOS)
     @NSApplicationDelegateAdaptor(LiteratureAtlasAppDelegate.self) private var appDelegate
@@ -44,6 +45,7 @@ struct LiteratureAtlasApp: App {
             case .available:
                 RootView()
                     .environmentObject(model)
+                    .environmentObject(nav)
             case .unavailable(let reason):
                 UnsupportedView(reason: String(describing: reason))
             }

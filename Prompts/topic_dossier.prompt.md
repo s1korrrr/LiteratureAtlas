@@ -1,22 +1,19 @@
-Topic: {{topic_name}}
+You are given a topic/cluster with representative paper titles, keywords, and condensed summaries.
 
-You are given a topic/cluster description with keywords and representative paper records.
+Write a compact Markdown dossier with these headings:
 
-Write a compact Markdown dossier with these exact headings:
-
-# Topic Snapshot
-# Subareas & Variants
-# Common Methods & Data
-# Representative Papers
-# Key Debates / Tradeoffs
-# Open Questions
-# Suggested Next Reads
+# Topic Summary
+# Why It Matters for Systematic Trading
+# Common Signal / Model Archetypes
+# Data & Implementation Notes
+# Failure Modes / Risks
+# Representative Papers (What Each Adds)
+# Next Prototypes (Minimal Experiments)
 
 Rules:
-- Use ONLY the provided metadata and paper records.
-- Cite papers by title (no authors/venues unless explicitly present).
-- If something is not supported, write "Not enough evidence in the provided metadata."
-- Keep the whole response under ~700 words.
+- Be specific and grounded in the provided context; do not invent results.
+- If key details are missing, say "Not specified in the provided summaries."
+- Keep it dense but readable (~500-900 words max).
 
 Context:
 {{context}}

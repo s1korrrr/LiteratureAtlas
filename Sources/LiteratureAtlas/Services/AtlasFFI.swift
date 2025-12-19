@@ -1,6 +1,8 @@
 import Foundation
 import Darwin
+#if ATLAS_FFI_LINKED
 import AtlasFFIClib
+#endif
 
 // Runtime dynamic loader for atlas_ffi (Rust) — safe to fail and fallback to Swift search.
 @available(macOS 26, iOS 26, *)

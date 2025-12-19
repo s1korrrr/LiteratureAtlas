@@ -75,11 +75,83 @@ actor PaperSummarizerActor {
             "text": String(text.prefix(2000))
         ])
         let response = try await makeSession().respond(to: prompt)
-        let lines = response.content
+        let rawLines = response.content
             .split(whereSeparator: \.isNewline)
-            .map { $0.replacingOccurrences(of: "•", with: "").trimmingCharacters(in: .whitespacesAndNewlines) }
+            .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
-        return lines
+
+        func looksLikeBullet(_ line: String) -> Bool {
+            let t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let bulletChars: Set<Character> = ["-", "*", "•", "–"]
+            if let first = t.first,
+               bulletChars.contains(first),
+               t.count >= 2 {
+                let second = t[t.index(after: t.startIndex)]
+                if second.isWhitespace { return true }
+            }
+            let digits = t.prefix(while: { $0.isNumber })
+            guard !digits.isEmpty else { return false }
+            let idx = t.index(t.startIndex, offsetBy: digits.count, limitedBy: t.endIndex) ?? t.endIndex
+            guard idx < t.endIndex else { return false }
+            let ch = t[idx]
+            return ch == "." || ch == ")"
+        }
+
+        let hasBullets = rawLines.contains(where: looksLikeBullet)
+        let candidates = hasBullets ? rawLines.filter(looksLikeBullet) : rawLines
+
+        func stripBulletPrefix(_ line: String) -> String {
+            var t = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            let bulletChars: Set<Character> = ["-", "*", "•", "–"]
+            func stripOneBullet(_ text: inout String) -> Bool {
+                guard let first = text.first, bulletChars.contains(first) else { return false }
+                guard text.count >= 2 else { return false }
+                let second = text[text.index(after: text.startIndex)]
+                guard second.isWhitespace else { return false }
+
+                // Drop the marker, then any whitespace after it.
+                text.removeFirst()
+                while let next = text.first, next.isWhitespace { text.removeFirst() }
+                return true
+            }
+
+            // Strip repeated bullet markers like "- - foo" (but don't destroy Markdown like "**Bold**").
+            while stripOneBullet(&t) {}
+
+            // Strip numbered bullets like "1. foo" / "2) foo".
+            let digits = t.prefix(while: { $0.isNumber })
+            if !digits.isEmpty {
+                let idx = t.index(t.startIndex, offsetBy: digits.count, limitedBy: t.endIndex) ?? t.endIndex
+                if idx < t.endIndex, (t[idx] == "." || t[idx] == ")") {
+                    t = String(t[t.index(after: idx)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    while stripOneBullet(&t) {}
+                }
+            }
+
+            return t.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        func isPlaceholderTakeaway(_ text: String) -> Bool {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let lower = trimmed.lowercased()
+            if lower.isEmpty { return true }
+            // The summarizer prompts encourage "Not specified" placeholders; keep takeaways crisp by dropping them.
+            if lower == "not specified" || lower == "unknown" { return true }
+            if lower.hasPrefix("not specified") || lower.hasPrefix("unknown") { return true }
+            if lower.contains("not specified") || lower.contains("unknown") { return true }
+            return false
+        }
+
+        let cleanedAll = candidates
+            .map(stripBulletPrefix)
+            .filter { !$0.isEmpty }
+
+        let cleaned = cleanedAll
+            .filter { !isPlaceholderTakeaway($0) }
+
+        // If everything was filtered out (model returned only placeholders), keep the first few anyway.
+        let chosen = cleaned.isEmpty ? cleanedAll : cleaned
+        return Array(chosen.prefix(5))
     }
 
     func summarize(title: String, text: String) async throws -> SummaryOutput {
@@ -103,20 +175,86 @@ actor PaperSummarizerActor {
         }
 
         // Consolidate into final summary.
-        let chunkBullets = chunkSummaries.enumerated().map { "Chunk \($0 + 1): \($1)" }.joined(separator: "\n")
-        let consolidatePrompt = PromptStore.render(template: consolidateTemplate, variables: [
-            "title": title,
-            "chunk_bullets": chunkBullets
-        ])
-
         do {
-            let consolidated = try await makeSession().respond(to: consolidatePrompt)
-            return SummaryOutput(summary: consolidated.content, chunksUsed: chunks.count, maxChunkCharsUsed: maxUsed)
+            let consolidated = try await consolidateSummary(title: title, chunkSummaries: chunkSummaries)
+            return SummaryOutput(summary: consolidated, chunksUsed: chunks.count, maxChunkCharsUsed: maxUsed)
         } catch {
             // Fallback: join chunk bullets if consolidation fails.
             let joined = chunkSummaries.joined(separator: "\n")
             return SummaryOutput(summary: joined, chunksUsed: chunks.count, maxChunkCharsUsed: maxUsed)
         }
+    }
+
+    private func consolidateSummary(title: String, chunkSummaries: [String]) async throws -> String {
+        let budgets = [3200, 2400, 1800, 1300, 900]
+        var lastError: Error? = nil
+
+        for maxChunkBulletsChars in budgets {
+            let chunkBullets = buildChunkBullets(chunkSummaries, maxChars: maxChunkBulletsChars)
+            let prompt = PromptStore.render(template: consolidateTemplate, variables: [
+                "title": title,
+                "chunk_bullets": chunkBullets
+            ])
+
+            do {
+                let consolidated = try await makeSession().respond(to: prompt)
+                return consolidated.content
+            } catch {
+                lastError = error
+                if LLMText.isContextLimitError(error) { continue }
+                throw error
+            }
+        }
+
+        throw lastError ?? NSError(domain: "Summarizer", code: 4, userInfo: [
+            NSLocalizedDescriptionKey: "Failed to consolidate summary within limits."
+        ])
+    }
+
+    private func buildChunkBullets(_ chunkSummaries: [String], maxChars: Int) -> String {
+        guard !chunkSummaries.isEmpty else { return "" }
+        let n = chunkSummaries.count
+        var perChunkMax = max(80, min(480, (maxChars / max(1, n)) - 16))
+
+        func render(indices: [Int], perChunkMax: Int) -> String {
+            indices.map { idx in
+                let cleaned = LLMText.collapseWhitespace(chunkSummaries[idx])
+                let clipped = LLMText.clip(cleaned, maxChars: perChunkMax)
+                return "Chunk \(idx + 1): \(clipped)"
+            }.joined(separator: "\n")
+        }
+
+        let all = Array(chunkSummaries.indices)
+        var out = render(indices: all, perChunkMax: perChunkMax)
+        while out.count > maxChars && perChunkMax > 60 {
+            perChunkMax = max(60, Int(Double(perChunkMax) * 0.85))
+            out = render(indices: all, perChunkMax: perChunkMax)
+        }
+        if out.count <= maxChars { return out }
+
+        // Still too long: select a subset, prioritizing coverage from start/end.
+        var order: [Int] = []
+        var left = 0
+        var right = n - 1
+        while left <= right {
+            order.append(left)
+            if right != left { order.append(right) }
+            left += 1
+            right -= 1
+        }
+
+        var selected: [Int] = []
+        var best = ""
+        for idx in order {
+            let candidate = (selected + [idx]).sorted()
+            let attempt = render(indices: candidate, perChunkMax: perChunkMax)
+            if attempt.count <= maxChars {
+                selected = candidate
+                best = attempt
+            }
+        }
+
+        return best.isEmpty ? LLMText.clip(out, maxChars: maxChars) : best
     }
 
     private func summarizeSingleChunk(title: String, chunk: String, chunkIndex: Int, totalChunks: Int) async throws -> (String, Int) {
@@ -198,8 +336,102 @@ actor PaperSummarizerActor {
 }
 
 @available(macOS 26, iOS 26, *)
+actor PaperTradingLensActor {
+    private let instructions: String
+    private let promptTemplate: String
+
+    init() {
+        let fallbackInstructions = """
+        You are a quant research assistant. Your job is to convert a paper summary into a trading applicability scorecard.
+        OUTPUT MUST BE VALID JSON ONLY (no Markdown fences, no extra text).
+        Be grounded in the provided context. If missing, use null, empty lists, or "Unknown".
+        """
+        let fallbackPromptTemplate = """
+        Title: {{title}}
+        Keywords: {{keywords}}
+
+        Technical summary:
+        {{summary}}
+
+        Takeaways:
+        {{takeaways}}
+
+        Return VALID JSON ONLY (no extra text) with keys:
+        title,
+        trading_tags, asset_classes, horizons, signal_archetypes,
+        where_it_fits { pipeline_stage, primary_use },
+        alpha_hypotheses [{ hypothesis, features, target, horizon }],
+        data_requirements { must_have, nice_to_have },
+        evaluation_notes { recommended_metrics, must_check },
+        risk_flags,
+        scores { novelty, usability, strategy_impact, confidence },
+        one_line_verdict.
+
+        Rules:
+        - If not specified, use "Unknown" or [].
+        - alpha_hypotheses: 1-3 items max.
+        - risk_flags: 0-4 items max.
+        """
+
+        instructions = PromptStore.loadText("paper_trading_lens.instructions.md", fallback: fallbackInstructions)
+        promptTemplate = PromptStore.loadText("paper_trading_lens.prompt.md", fallback: fallbackPromptTemplate)
+    }
+
+    private func isContextLimitError(_ error: Error) -> Bool {
+        LLMText.isContextLimitError(error)
+    }
+
+    func scorecard(title: String, keywords: [String]?, summary: String, takeaways: [String]?) async throws -> PaperTradingLens {
+        let cleanedKeywords = (keywords ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let keywordText = LLMText.clip(cleanedKeywords.prefix(20).joined(separator: ", "), maxChars: 220)
+
+        let cleanedSummary = LLMText.collapseWhitespace(summary)
+        let cleanedTakeaways = (takeaways ?? [])
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let takeawaysText = LLMText.collapseWhitespace(cleanedTakeaways.prefix(8).joined(separator: "\n"))
+
+        let attempts: [(summaryLimit: Int, takeawaysLimit: Int)] = [
+            (summaryLimit: 1800, takeawaysLimit: 900),
+            (summaryLimit: 1300, takeawaysLimit: 650),
+            (summaryLimit: 900, takeawaysLimit: 450),
+            (summaryLimit: 650, takeawaysLimit: 300),
+            (summaryLimit: 450, takeawaysLimit: 220),
+            (summaryLimit: 320, takeawaysLimit: 160),
+            (summaryLimit: 220, takeawaysLimit: 120),
+            (summaryLimit: 160, takeawaysLimit: 80)
+        ]
+
+        var lastError: Error?
+        for attempt in attempts {
+            let prompt = PromptStore.render(template: promptTemplate, variables: [
+                "title": LLMText.clip(title, maxChars: 140),
+                "keywords": keywordText,
+                "summary": LLMText.clip(cleanedSummary, maxChars: attempt.summaryLimit),
+                "takeaways": LLMText.clip(takeawaysText, maxChars: attempt.takeawaysLimit)
+            ])
+            do {
+                // A LanguageModelSession can retain conversation context; use a fresh session per attempt to avoid growth
+                // across many scorecards (e.g., trading-lens backfills).
+                let session = LanguageModelSession(instructions: instructions)
+                let response = try await session.respond(to: prompt)
+                return try ModelJSON.decodeFirstJSON(PaperTradingLens.self, from: response.content)
+            } catch {
+                lastError = error
+                if isContextLimitError(error) { continue }
+                throw error
+            }
+        }
+
+        throw lastError ?? NSError(domain: "PaperTradingLens", code: 1, userInfo: [NSLocalizedDescriptionKey: "Failed to generate trading lens scorecard."])
+    }
+}
+
+@available(macOS 26, iOS 26, *)
 actor ClusterSummarizerActor {
-    private let session: LanguageModelSession
+    private let instructions: String
     private let promptTemplate: String
 
     init() {
@@ -220,27 +452,56 @@ actor ClusterSummarizerActor {
         Summaries:
         {{summaries}}
         """
-        let instructions = PromptStore.loadText("cluster_summarizer.instructions.md", fallback: fallbackInstructions)
+        instructions = PromptStore.loadText("cluster_summarizer.instructions.md", fallback: fallbackInstructions)
         promptTemplate = PromptStore.loadText("cluster_summarizer.prompt.md", fallback: fallbackPromptTemplate)
-        session = LanguageModelSession(instructions: instructions)
     }
 
     func summarizeCluster(index: Int, summaries: [String]) async throws -> ClusterSummary {
-        let limited = summaries.prefix(20)
-        var list = ""
-        for (i, summary) in limited.enumerated() {
-            list += "Paper \(i + 1): \(summary)\n\n"
+        func buildList(maxChars: Int) -> String {
+            let limited = summaries.prefix(20)
+            var list = ""
+            for (i, summary) in limited.enumerated() {
+                let cleaned = LLMText.collapseWhitespace(summary)
+                let clipped = LLMText.clip(cleaned, maxChars: 700)
+                let entry = "Paper \(i + 1): \(clipped)\n\n"
+
+                if !list.isEmpty, list.count + entry.count > maxChars { break }
+                list += entry
+                if list.count >= maxChars { break }
+            }
+            return list.trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
-        let prompt = PromptStore.render(template: promptTemplate, variables: [
-            "summaries": list
-        ])
+        let budgets = [5200, 3800, 2800, 2000, 1400]
+        var content: String? = nil
+        var lastError: Error? = nil
+        for budget in budgets {
+            let list = buildList(maxChars: budget)
+            let prompt = PromptStore.render(template: promptTemplate, variables: [
+                "summaries": list
+            ])
 
-        let response = try await session.respond(to: prompt)
-        let content = response.content
+            do {
+                let session = LanguageModelSession(instructions: instructions)
+                let response = try await session.respond(to: prompt)
+                content = response.content
+                break
+            } catch {
+                lastError = error
+                if LLMText.isContextLimitError(error) { continue }
+                throw error
+            }
+        }
+
+        guard let content else {
+            throw lastError ?? NSError(domain: "ClusterSummarizer", code: 1, userInfo: [
+                NSLocalizedDescriptionKey: "Failed to summarize cluster."
+            ])
+        }
 
         var name = "Cluster \(index + 1)"
         var meta = "Contains \(summaries.count) papers."
+        var lensBlock: String? = nil
 
         if let nameRange = content.range(of: "Cluster name:") {
             let rest = content[nameRange.upperBound...]
@@ -256,16 +517,23 @@ actor ClusterSummarizerActor {
         if let metaRange = content.range(of: "Meta-summary:") {
             let rest = content[metaRange.upperBound...]
             let text = rest.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { meta = text }
+            if let lens = text.range(of: "Trading lens:") {
+                let onlyMeta = text[..<lens.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !onlyMeta.isEmpty { meta = onlyMeta }
+                let lensText = text[lens.lowerBound...].trimmingCharacters(in: .whitespacesAndNewlines)
+                if !lensText.isEmpty { lensBlock = lensText }
+            } else if !text.isEmpty {
+                meta = text
+            }
         }
 
-        return ClusterSummary(name: name, metaSummary: meta)
+        return ClusterSummary(name: name, metaSummary: meta, tradingLens: lensBlock)
     }
 }
 
 @available(macOS 26, iOS 26, *)
 actor QuestionAnswerActor {
-    private let session: LanguageModelSession
+    private let instructions: String
     private let topPapersTemplate: String
     private let evidenceTemplate: String
 
@@ -294,52 +562,105 @@ actor QuestionAnswerActor {
 
         Write 3-5 concise paragraphs. Cite papers by title when appropriate. If the evidence is insufficient, say so explicitly.
         """
-        let instructions = PromptStore.loadText("question_answerer.instructions.md", fallback: fallbackInstructions)
+        instructions = PromptStore.loadText("question_answerer.instructions.md", fallback: fallbackInstructions)
         topPapersTemplate = PromptStore.loadText("question_answerer.top_papers.prompt.md", fallback: fallbackTopPapersTemplate)
         evidenceTemplate = PromptStore.loadText("question_answerer.evidence.prompt.md", fallback: fallbackEvidenceTemplate)
-        session = LanguageModelSession(instructions: instructions)
     }
 
     func answer(question: String, topPapers: [ScoredPaper]) async throws -> String {
-        var context = ""
-        for (i, scored) in topPapers.enumerated() {
-            let paper = scored.paper
-            let scoreText = String(format: "%.2f", scored.score)
-            context += "Paper \(i + 1): \(paper.title)\nSummary: \(paper.summary)\nRelevance score: \(scoreText)\n\n"
+        func buildContext(maxChars: Int, perSummaryChars: Int) -> String {
+            var context = ""
+            for (i, scored) in topPapers.prefix(10).enumerated() {
+                let paper = scored.paper
+                let scoreText = String(format: "%.2f", scored.score)
+                let summary = LLMText.clip(LLMText.collapseWhitespace(paper.summary), maxChars: perSummaryChars)
+                let entry = "Paper \(i + 1): \(paper.title)\nSummary: \(summary)\nRelevance score: \(scoreText)\n\n"
+                if !context.isEmpty, context.count + entry.count > maxChars { break }
+                context += entry
+                if context.count >= maxChars { break }
+            }
+            return context.trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
-        let prompt = PromptStore.render(template: topPapersTemplate, variables: [
-            "question": question,
-            "papers_context": context
-        ])
+        let budgets: [(maxChars: Int, perSummaryChars: Int)] = [
+            (maxChars: 6500, perSummaryChars: 900),
+            (maxChars: 4800, perSummaryChars: 650),
+            (maxChars: 3400, perSummaryChars: 450)
+        ]
 
-        let response = try await session.respond(to: prompt)
-        return response.content
+        var lastError: Error? = nil
+        for budget in budgets {
+            let prompt = PromptStore.render(template: topPapersTemplate, variables: [
+                "question": LLMText.clip(question, maxChars: 700),
+                "papers_context": buildContext(maxChars: budget.maxChars, perSummaryChars: budget.perSummaryChars)
+            ])
+
+            do {
+                let session = LanguageModelSession(instructions: instructions)
+                let response = try await session.respond(to: prompt)
+                return response.content
+            } catch {
+                lastError = error
+                if LLMText.isContextLimitError(error) { continue }
+                throw error
+            }
+        }
+
+        throw lastError ?? NSError(domain: "QuestionAnswer", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "Failed to answer question within context limits."
+        ])
     }
 
     func answer(question: String, evidence: [ChunkEvidence]) async throws -> String {
-        let limited = evidence.prefix(12)
-        let context = limited.enumerated().map { idx, ev in
-            let snippet = ev.chunk.text.prefix(1200)
-            return """
-            Evidence \(idx + 1) — \(ev.paperTitle) (score \(String(format: "%.3f", ev.score))):
-            \(snippet)
-            """
-        }.joined(separator: "\n\n")
+        func buildEvidenceContext(maxChars: Int, perSnippetChars: Int) -> String {
+            var context = ""
+            for (idx, ev) in evidence.prefix(12).enumerated() {
+                let snippet = LLMText.clip(LLMText.collapseWhitespace(String(ev.chunk.text.prefix(perSnippetChars * 2))), maxChars: perSnippetChars)
+                let entry = """
+                Evidence \(idx + 1) — \(ev.paperTitle) (score \(String(format: "%.3f", ev.score))):
+                \(snippet)
+                """
+                let chunk = entry + "\n\n"
+                if !context.isEmpty, context.count + chunk.count > maxChars { break }
+                context += chunk
+                if context.count >= maxChars { break }
+            }
+            return context.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
 
-        let prompt = PromptStore.render(template: evidenceTemplate, variables: [
-            "question": question,
-            "evidence_context": context
+        let budgets: [(maxChars: Int, perSnippetChars: Int)] = [
+            (maxChars: 6500, perSnippetChars: 900),
+            (maxChars: 4800, perSnippetChars: 650),
+            (maxChars: 3400, perSnippetChars: 450)
+        ]
+
+        var lastError: Error? = nil
+        for budget in budgets {
+            let prompt = PromptStore.render(template: evidenceTemplate, variables: [
+                "question": LLMText.clip(question, maxChars: 700),
+                "evidence_context": buildEvidenceContext(maxChars: budget.maxChars, perSnippetChars: budget.perSnippetChars)
+            ])
+
+            do {
+                let session = LanguageModelSession(instructions: instructions)
+                let response = try await session.respond(to: prompt)
+                return response.content
+            } catch {
+                lastError = error
+                if LLMText.isContextLimitError(error) { continue }
+                throw error
+            }
+        }
+
+        throw lastError ?? NSError(domain: "QuestionAnswer", code: 2, userInfo: [
+            NSLocalizedDescriptionKey: "Failed to answer with evidence within context limits."
         ])
-
-        let response = try await session.respond(to: prompt)
-        return response.content
     }
 }
 
 @available(macOS 26, iOS 26, *)
 actor CorpusBriefingActor {
-    private let session: LanguageModelSession
+    private let instructions: String
     private let promptTemplate: String
 
     init() {
@@ -369,16 +690,16 @@ actor CorpusBriefingActor {
         Context:
         {{context}}
         """
-        let instructions = PromptStore.loadText("corpus_briefing.instructions.md", fallback: fallbackInstructions)
+        instructions = PromptStore.loadText("corpus_briefing.instructions.md", fallback: fallbackInstructions)
         promptTemplate = PromptStore.loadText("corpus_briefing.prompt.md", fallback: fallbackPromptTemplate)
-        session = LanguageModelSession(instructions: instructions)
     }
 
     func brief(context: String) async throws -> String {
         let prompt = PromptStore.render(template: promptTemplate, variables: [
-            "context": context
+            "context": LLMText.clip(context, maxChars: 8_000)
         ])
 
+        let session = LanguageModelSession(instructions: instructions)
         let response = try await session.respond(to: prompt)
         return response.content
     }
@@ -386,7 +707,7 @@ actor CorpusBriefingActor {
 
 @available(macOS 26, iOS 26, *)
 actor TopicDossierActor {
-    private let session: LanguageModelSession
+    private let instructions: String
     private let promptTemplate: String
 
     init() {
@@ -415,17 +736,17 @@ actor TopicDossierActor {
         Context:
         {{context}}
         """
-        let instructions = PromptStore.loadText("topic_dossier.instructions.md", fallback: fallbackInstructions)
+        instructions = PromptStore.loadText("topic_dossier.instructions.md", fallback: fallbackInstructions)
         promptTemplate = PromptStore.loadText("topic_dossier.prompt.md", fallback: fallbackPromptTemplate)
-        session = LanguageModelSession(instructions: instructions)
     }
 
     func dossier(topicName: String, context: String) async throws -> String {
         let prompt = PromptStore.render(template: promptTemplate, variables: [
             "topic_name": topicName,
-            "context": context
+            "context": LLMText.clip(context, maxChars: 8_000)
         ])
 
+        let session = LanguageModelSession(instructions: instructions)
         let response = try await session.respond(to: prompt)
         return response.content
     }

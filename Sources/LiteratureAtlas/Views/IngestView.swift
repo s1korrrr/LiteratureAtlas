@@ -10,6 +10,7 @@ struct IngestView: View {
     @State private var assumptionNarrative: String = ""
     @State private var topEdges: [ClaimEdge] = []
     @State private var showStyleTips = false
+    @State private var selectedPaper: Paper?
 
     var body: some View {
         NavigationStack {
@@ -86,24 +87,17 @@ struct IngestView: View {
 
                     GlassCard {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Log")
-                                .font(.headline)
                             if showStyleTips {
-                                Text("Tip: keep this view open; clustering can run in parallel; hover status pills for detail.")
+                                Text("Tip: keep this view open; clustering can run in parallel; hover rows for quick actions.")
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
-                            ScrollView {
-                                Text(model.ingestionLog.isEmpty ? "No logs yet." : model.ingestionLog)
-                                    .font(.system(.footnote, design: .monospaced))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-                            .frame(minHeight: 200)
+                            InteractiveLogPanel(title: "Log", text: $model.ingestionLog, minHeight: 240)
                         }
                     }
 
                     if !model.papers.isEmpty {
-                        readingPlannerCard
+                        ReadingPlannerCard(selectedPaper: $selectedPaper)
                         claimGraphCard
                         assumptionStressCard
                     }
@@ -113,6 +107,10 @@ struct IngestView: View {
                 .padding()
             }
             .navigationTitle("Literature Atlas")
+        }
+        .sheet(item: $selectedPaper) { paper in
+            PaperDetailView(paper: paper)
+                .environmentObject(model)
         }
         .fileImporter(
             isPresented: $showFolderPicker,
@@ -191,77 +189,6 @@ struct IngestView: View {
             .background(color.opacity(0.15), in: Capsule())
             .overlay(Capsule().stroke(color.opacity(0.3), lineWidth: 1))
             .foregroundStyle(color)
-    }
-
-    private var readingPlannerCard: some View {
-        let nextPapers = model.recommendedNextPapers()
-        let blind = model.blindSpots(limit: 3)
-        let curriculum = model.adaptiveCurriculum().prefix(5)
-        return GlassCard {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Reading planner")
-                    .font(.headline)
-                Text("Adaptive picks based on your done/important papers and question history.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                if nextPapers.isEmpty {
-                    Text("Mark some papers as done to unlock recommendations.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text("Next up (\(nextPapers.count))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    ForEach(nextPapers.prefix(5)) { paper in
-                        HStack {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(paper.title).font(.subheadline.bold())
-                                Text(paper.summary).font(.caption2).lineLimit(2)
-                            }
-                            Spacer()
-                            if let status = paper.readingStatus {
-                                Text(status.label)
-                                    .font(.caption2)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 4)
-                                    .background(Color.blue.opacity(0.1), in: Capsule())
-                            }
-                        }
-                    }
-                }
-
-                if !blind.isEmpty {
-                    Divider().padding(.vertical, 4)
-                    Text("Blind spots (central but far from you)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    ForEach(blind) { paper in
-                        Text("• \(paper.title)")
-                            .font(.caption2)
-                    }
-                }
-
-                if !curriculum.isEmpty {
-                    Divider().padding(.vertical, 4)
-                    Text("Adaptive curriculum")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    ForEach(curriculum, id: \.id) { step in
-                        HStack {
-                            Text(step.stage.label)
-                                .font(.caption2.bold())
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 3)
-                                .background(Color.orange.opacity(0.1), in: Capsule())
-                            Text(step.paper.title)
-                                .font(.caption2)
-                                .lineLimit(1)
-                            Spacer()
-                        }
-                    }
-                }
-            }
-        }
     }
 
     private var claimGraphCard: some View {

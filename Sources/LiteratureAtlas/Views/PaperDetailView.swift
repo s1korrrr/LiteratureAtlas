@@ -18,6 +18,7 @@ struct PaperDetailView: View {
     @State private var showQuiz: Bool = false
     @State private var quizIndex: Int = 0
     @State private var revealAnswer: Bool = false
+    @State private var createdStrategyProject: StrategyProject?
 
     private var metrics: AnalyticsSummary.PaperMetric? {
         model.analyticsSummary?.paperMetrics.first(where: { $0.paperID == paper.id })
@@ -88,6 +89,90 @@ struct PaperDetailView: View {
                                 }
                                 .font(.footnote)
                             }
+                        }
+                    }
+                }
+
+                GlassCard {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Trading lens").font(.headline)
+                            Spacer()
+                            Button {
+                                model.generateTradingLens(for: paper.id)
+                            } label: {
+                                Label((latestPaper()?.tradingLens ?? paper.tradingLens) == nil ? "Generate" : "Regenerate", systemImage: "sparkles")
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button {
+                                createdStrategyProject = model.createStrategyProject(from: paper.id)
+                            } label: {
+                                Label("Create project", systemImage: "point.3.connected.trianglepath")
+                            }
+                            .buttonStyle(.bordered)
+                        }
+
+                        if let lens = (latestPaper()?.tradingLens ?? paper.tradingLens) {
+                            if let verdict = lens.oneLineVerdict, !verdict.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                Text(verdict)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            if let scores = lens.scores,
+                               scores.novelty != nil || scores.usability != nil || scores.strategyImpact != nil || scores.confidence != nil {
+                                HStack {
+                                    if let novelty = scores.novelty { MetricPill(label: "Novelty", value: novelty, tint: .orange) }
+                                    if let usability = scores.usability { MetricPill(label: "Usability", value: usability, tint: .mint) }
+                                    if let impact = scores.strategyImpact { MetricPill(label: "Impact", value: impact, tint: .blue) }
+                                    if let conf = scores.confidence { MetricPill(label: "Conf.", value: conf * 10, tint: .purple) }
+                                }
+                                Text("Conf. shown on a 0–10 scale.")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Group {
+                                if let tags = lens.tradingTags, !tags.isEmpty {
+                                    Text("Tags: \(tags.joined(separator: ", "))")
+                                }
+                                if let assets = lens.assetClasses, !assets.isEmpty {
+                                    Text("Assets: \(assets.joined(separator: ", "))")
+                                }
+                                if let horizons = lens.horizons, !horizons.isEmpty {
+                                    Text("Horizon: \(horizons.joined(separator: ", "))")
+                                }
+                                if let archetypes = lens.signalArchetypes, !archetypes.isEmpty {
+                                    Text("Archetypes: \(archetypes.joined(separator: ", "))")
+                                }
+                                if let flags = lens.riskFlags, !flags.isEmpty {
+                                    Text("Risk flags: \(flags.joined(separator: ", "))")
+                                }
+                            }
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                            if let hyps = lens.alphaHypotheses, !hyps.isEmpty {
+                                Divider().padding(.vertical, 4)
+                                Text("Alpha hypotheses").font(.subheadline.bold())
+                                ForEach(Array(hyps.prefix(3).enumerated()), id: \.offset) { _, h in
+                                    let text = h.hypothesis ?? "Unknown"
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("• \(text)").font(.footnote)
+                                        if let target = h.target, !target.isEmpty {
+                                            Text("target: \(target)").font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                        if let horizon = h.horizon, !horizon.isEmpty {
+                                            Text("horizon: \(horizon)").font(.caption2).foregroundStyle(.secondary)
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            Text("No trading lens scorecard yet.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                         }
                     }
                 }
@@ -177,6 +262,56 @@ struct PaperDetailView: View {
                                 }
                                 .frame(minHeight: 120, maxHeight: 220)
                             }
+                        }
+                    }
+                }
+
+                GlassCard {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Strategy prototypes").font(.headline)
+                        HStack {
+                            Button {
+                                model.generateStrategyBlueprint(for: paper.id)
+                            } label: {
+                                Label("Generate", systemImage: "wand.and.stars")
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button {
+                                model.auditBacktest(for: paper.id)
+                            } label: {
+                                Label("Audit backtest", systemImage: "checkmark.shield")
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled((latestPaper()?.strategyBlueprint ?? "").isEmpty)
+
+                            Spacer()
+                        }
+
+                        if let blueprint = latestPaper()?.strategyBlueprint, !blueprint.isEmpty {
+                            Divider().padding(.vertical, 4)
+                            Text("Blueprint").font(.subheadline.bold())
+                            ScrollView {
+                                Text(blueprint)
+                                    .font(.system(.footnote, design: .monospaced))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(minHeight: 120, maxHeight: 280)
+                        } else {
+                            Text("No strategy blueprint yet.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+
+                        if let audit = latestPaper()?.backtestAudit, !audit.isEmpty {
+                            Divider().padding(.vertical, 4)
+                            Text("Backtest audit").font(.subheadline.bold())
+                            ScrollView {
+                                Text(audit)
+                                    .font(.system(.footnote, design: .monospaced))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .frame(minHeight: 120, maxHeight: 280)
                         }
                     }
                 }
@@ -372,6 +507,10 @@ struct PaperDetailView: View {
                 .buttonStyle(.bordered)
             }
         }
+        .sheet(item: $createdStrategyProject) { project in
+            StrategyProjectDetailView(strategyID: project.id)
+                .environmentObject(model)
+        }
     }
 
     private func sectionCard(title: String, text: String) -> some View {
@@ -416,7 +555,7 @@ struct PaperDetailView: View {
         let template = PromptStore.loadText("ui.eli.prompt.md", fallback: fallbackTemplate)
         let prompt = PromptStore.render(template: template, variables: [
             "level": levelText,
-            "summary": paper.summary
+            "summary": LLMText.clip(paper.summary, maxChars: 2200)
         ])
         do {
             let session = LanguageModelSession(instructions: instructions)

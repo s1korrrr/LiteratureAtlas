@@ -5,8 +5,4 @@ Text:
 {{text}}
 
 Write 2-3 bullet points focusing on what this section covers.
-
-Rules:
-- Use ONLY the provided section text.
-- Prefer concrete details (definitions, objectives, method steps, assumptions) if present.
-- If a key detail is missing, write "Not specified in the provided text."
+If it mentions data, horizon, evaluation, transaction costs, slippage, or constraints, include that explicitly.

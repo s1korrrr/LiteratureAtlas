@@ -512,6 +512,116 @@ struct AnalyticsSummary: Codable, Equatable {
         let duplicates: Duplicates?
     }
 
+    struct TradingSection: Codable, Equatable {
+        struct TagCount: Codable, Equatable {
+            let tag: String
+            let count: Int
+        }
+
+        struct AssetClassCount: Codable, Equatable {
+            let assetClass: String
+            let count: Int
+
+            enum CodingKeys: String, CodingKey {
+                case assetClass = "asset_class"
+                case count
+            }
+        }
+
+        struct HorizonCount: Codable, Equatable {
+            let horizon: String
+            let count: Int
+        }
+
+        struct RiskFlagCount: Codable, Equatable {
+            let riskFlag: String
+            let count: Int
+
+            enum CodingKeys: String, CodingKey {
+                case riskFlag = "risk_flag"
+                case count
+            }
+        }
+
+        struct TagTrend: Codable, Equatable {
+            let tag: String
+            let year: Int
+            let count: Int
+        }
+
+        struct ScorePoint: Codable, Equatable {
+            let paperID: UUID
+            let year: Int?
+            let clusterID: Int?
+            let novelty: Double
+            let usability: Double
+            let strategyImpact: Double?
+            let confidence: Double?
+            let priority: Double?
+            let primaryTag: String?
+            let primaryAssetClass: String?
+            let primaryHorizon: String?
+            let oneLineVerdict: String?
+            let hasStrategyBlueprint: Bool?
+            let hasBacktestAudit: Bool?
+
+            enum CodingKeys: String, CodingKey {
+                case paperID = "paper_id"
+                case year
+                case clusterID = "cluster_id"
+                case novelty
+                case usability
+                case strategyImpact = "strategy_impact"
+                case confidence
+                case priority
+                case primaryTag = "primary_tag"
+                case primaryAssetClass = "primary_asset_class"
+                case primaryHorizon = "primary_horizon"
+                case oneLineVerdict = "one_line_verdict"
+                case hasStrategyBlueprint = "has_strategy_blueprint"
+                case hasBacktestAudit = "has_backtest_audit"
+            }
+        }
+
+        struct PriorityEntry: Codable, Equatable {
+            let paperID: UUID
+            let priority: Double?
+            let oneLineVerdict: String?
+
+            enum CodingKeys: String, CodingKey {
+                case paperID = "paper_id"
+                case priority
+                case oneLineVerdict = "one_line_verdict"
+            }
+        }
+
+        let available: Bool?
+        let reason: String?
+        let paperCountWithLens: Int?
+        let coveragePct: Double?
+        let tagCounts: [TagCount]?
+        let assetClassCounts: [AssetClassCount]?
+        let horizonCounts: [HorizonCount]?
+        let riskFlagCounts: [RiskFlagCount]?
+        let tagTrends: [TagTrend]?
+        let scorePoints: [ScorePoint]?
+        let topPriority: [PriorityEntry]?
+
+        enum CodingKeys: String, CodingKey {
+            case available
+            case reason
+            case paperCountWithLens = "paper_count_with_lens"
+            case coveragePct = "coverage_pct"
+            case tagCounts = "tag_counts"
+            case assetClassCounts = "asset_class_counts"
+            case horizonCounts = "horizon_counts"
+            case riskFlagCounts = "risk_flag_counts"
+            case tagTrends = "tag_trends"
+            case scorePoints = "score_points"
+            case topPriority = "top_priority"
+        }
+    }
+
     struct TopicTrend: Codable, Equatable {
         let clusterID: Int
         let year: Int
@@ -772,6 +882,7 @@ struct AnalyticsSummary: Codable, Equatable {
     let bridges: BridgesSection?
     let citations: CitationsSection?
     let claims: ClaimsSection?
+    let trading: TradingSection?
     let workflow: WorkflowSection?
     let hygiene: HygieneSection?
 
@@ -806,6 +917,7 @@ struct AnalyticsSummary: Codable, Equatable {
         case bridges
         case citations
         case claims
+        case trading
         case workflow
         case hygiene
     }
@@ -842,6 +954,7 @@ struct AnalyticsSummary: Codable, Equatable {
         bridges = try container.decodeIfPresent(BridgesSection.self, forKey: .bridges)
         citations = try container.decodeIfPresent(CitationsSection.self, forKey: .citations)
         claims = try container.decodeIfPresent(ClaimsSection.self, forKey: .claims)
+        trading = try container.decodeIfPresent(TradingSection.self, forKey: .trading)
         workflow = try container.decodeIfPresent(WorkflowSection.self, forKey: .workflow)
         hygiene = try container.decodeIfPresent(HygieneSection.self, forKey: .hygiene)
     }

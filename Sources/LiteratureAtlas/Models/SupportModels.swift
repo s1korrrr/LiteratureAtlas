@@ -4,6 +4,7 @@ struct Cluster: Identifiable, Equatable, Codable {
     var id: Int
     var name: String
     var metaSummary: String
+    var tradingLens: String? = nil
     var centroid: [Float]
     var memberPaperIDs: [UUID]
     var layoutPosition: Point2D?
@@ -50,6 +51,7 @@ struct ChunkEvidence: Identifiable, Equatable {
 struct ClusterSummary {
     let name: String
     let metaSummary: String
+    let tradingLens: String?
 }
 
 struct ClusterInsights: Equatable {
